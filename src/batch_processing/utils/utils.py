@@ -34,6 +34,8 @@ from rich.progress import (
 INPUT_FILES = [
     "co2.nc",
     "projected-co2.nc",
+    "ch4.nc",
+    "projected-ch4.nc",
     "drainage.nc",
     "fri-fire.nc",
     "run-mask.nc",
@@ -46,7 +48,7 @@ INPUT_FILES = [
     "historic-climate.nc",
 ]
 
-INPUT_FILES_TO_COPY = ["co2.nc", "projected-co2.nc"]
+INPUT_FILES_TO_COPY = ["co2.nc", "projected-co2.nc", "ch4.nc", "projected-ch4.nc"]
 
 IO_PATHS = {
     "parameter_dir": "parameters/",
@@ -60,6 +62,8 @@ IO_PATHS = {
     "soil_texture_file": "input/soil-texture.nc",
     "co2_file": "input/co2.nc",
     "proj_co2_file": "input/projected-co2.nc",
+    "ch4_file": "input/ch4.nc",
+    "proj_ch4_file": "input/projected-ch4.nc",
     "topo_file": "input/topo.nc",
     "fri_fire_file": "input/fri-fire.nc",
     "hist_exp_fire_file": "input/historic-explicit-fire.nc",

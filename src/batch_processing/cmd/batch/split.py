@@ -236,7 +236,6 @@ class BatchSplitCommand(BaseCommand):
             )
             ds = xr.open_zarr(path)
         else:
-            #ds = xr.open_dataset(self.input_path / "run-mask.nc", engine="h5netcdf")
             ds = xr.open_dataset(
                 self.input_path / "run-mask.nc",
                 engine="h5netcdf",
@@ -312,9 +311,19 @@ class BatchSplitCommand(BaseCommand):
             dst_projected_co2 = batch_dir / "projected-co2.nc"
             shutil.copy(src_projected_co2, dst_projected_co2)
 
+            src_ch4 = co2_dest / "ch4.nc"
+            dst_ch4 = batch_dir / "ch4.nc"
+            shutil.copy(src_ch4, dst_ch4)
+
+            src_projected_ch4 = co2_dest / "projected-ch4.nc"
+            dst_projected_ch4 = batch_dir / "projected-ch4.nc"
+            shutil.copy(src_projected_ch4, dst_projected_ch4)
+
         if reading_remote_data:
             os.remove(os.path.join(co2_dest, "co2.nc"))
             os.remove(os.path.join(co2_dest, "projected-co2.nc"))
+            os.remove(os.path.join(co2_dest, "ch4.nc"))
+            os.remove(os.path.join(co2_dest, "projected-ch4.nc"))
 
         print("Split input files")
         if reading_remote_data:
