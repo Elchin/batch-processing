@@ -124,6 +124,11 @@ class BatchSplitCommand(BaseCommand):
             job_name = f"{self.base_batch_dir.name}-batch-{index}"
 
         additional_flags = "--no-output-cleanup" if getattr(self._args, 'restart_run', False) else ""
+        scenario_continuation = getattr(self._args, "scenario_continuation", False)
+        flags_before_max_output = (
+            "--no-output-cleanup" if scenario_continuation else ""
+        )
+        mpi_ranks = max(1, int(getattr(self._args, "mpi_ranks", 1)))
 
         substitution_values = {
             "job_name": job_name,
@@ -138,6 +143,8 @@ class BatchSplitCommand(BaseCommand):
             "t": self._args.t,
             "n": self._args.n,
             "additional_flags": additional_flags,
+            "flags_before_max_output": flags_before_max_output,
+            "mpi_ranks": mpi_ranks,
         }
 
         script_path = batch_dir / "slurm_runner.sh"
