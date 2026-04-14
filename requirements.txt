@@ -9,6 +9,7 @@ rich
 cftime
 matplotlib
 xarray
+bokeh
 zarr
 dask
 dask-jobqueue

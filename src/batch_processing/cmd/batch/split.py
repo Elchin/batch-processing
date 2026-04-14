@@ -118,10 +118,12 @@ class BatchSplitCommand(BaseCommand):
         config_file = batch_dir / "config" / "config.js"
         #update_config(path=config_file.as_posix(), prefix_value=batch_dir)
         scenario_continuation = getattr(self._args, "scenario_continuation", False)
+        restart_from = getattr(self._args, "restart_from", None)
         update_config(
             path=config_file.as_posix(),
             prefix_value=batch_dir,
             scenario_continuation=scenario_continuation,
+            restart_from=restart_from,
         )
         mpi_ranks = max(1, int(getattr(self._args, "mpi_ranks", 1)))
 

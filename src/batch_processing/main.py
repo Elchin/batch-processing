@@ -27,6 +27,18 @@ BatchRunCommand = lazy_import.lazy_class(
 BatchMergeCommand = lazy_import.lazy_class(
     "batch_processing.cmd.batch.merge.BatchMergeCommand"
 )
+WiemipSplitCommand = lazy_import.lazy_class(
+    "batch_processing.cmd.batch.wiemip_split.WiemipSplitCommand"
+)
+WiemipMergeCommand = lazy_import.lazy_class(
+    "batch_processing.cmd.batch.wiemip_merge.WiemipMergeCommand"
+)
+WiemipReRunCommand = lazy_import.lazy_class(
+    "batch_processing.cmd.batch.wiemip_rerun.WiemipReRunCommand"
+)
+WiemipReRunMergeCommand = lazy_import.lazy_class(
+    "batch_processing.cmd.batch.wiemip_rerun_merge.WiemipReRunMergeCommand"
+)
 BatchPlotCommand = lazy_import.lazy_class(
     "batch_processing.cmd.batch.plot.BatchPlotCommand"
 )
@@ -261,6 +273,15 @@ def batch_split(
             "before --max-output-volume in slurm runner"
         ),
     ),
+    restart_from: Optional[str] = typer.Option(
+        None,
+        "--restart_from",
+        "--restart-from",
+        help=(
+            "Override IO.restart_from in generated config.js with the exact value "
+            "provided (example: --restart_from \"\")."
+        ),
+    ),
     mpi_ranks: int = typer.Option(
         1,
         "--mpi-ranks",
@@ -286,10 +307,119 @@ def batch_split(
         "job_name_prefix": job_name_prefix,
         "restart_run": restart_run,
         "scenario_continuation": scenario_continuation,
+        "restart_from": restart_from,
         "mpi_ranks": mpi_ranks,
     }
     args = type("Args", (), all_args)()
     BatchSplitCommand(args).execute()
+
+
+@batch_app.command("wiemip_split")
+def batch_wiemip_split(
+    slurm_partition: SlurmPartition = typer.Option(
+        SlurmPartition.spot,
+        "--slurm-partition",
+        "-sp",
+        help="Specify the Slurm partition.",
+    ),
+    input_path: str = typer.Option(
+        ...,
+        "--input-path",
+        "-i",
+        help=(
+            "Local path to original WIEMIP setup inputs (for example "
+            "/mnt/exacloud/ejafarov_woodwellclimate_org/wiemip/setup_05deg_updated). "
+            "wiemip_split now performs internal filter/crop staging before Y-stripe split."
+        ),
+    ),
+    batches: str = typer.Option(
+        ...,
+        "--batches",
+        "-b",
+        help=(
+            "Path to store split batches. The given path is concatenated "
+            "with /mnt/exacloud/$USER"
+        ),
+    ),
+    nbatches: int = typer.Option(
+        ...,
+        "--nbatches",
+        "-N",
+        help="Number of Y-stripe batches to create.",
+    ),
+    launch_as_job: bool = typer.Option(
+        False,
+        "--launch-as-job",
+        help="Internal option for launching this command as a separate job.",
+    ),
+    p: int = typer.Option(0, "--p", "-p", help="Number of PRE RUN years to run."),
+    e: int = typer.Option(0, "--e", "-e", help="Number of EQUILIBRIUM years to run."),
+    s: int = typer.Option(0, "--s", "-s", help="Number of SPINUP years to run."),
+    t: int = typer.Option(0, "--t", "-t", help="Number of TRANSIENT years to run."),
+    n: int = typer.Option(0, "--n", "-n", help="Number of SCENARIO years to run."),
+    log_level: LogLevel = typer.Option(
+        LogLevel.disabled, "--log-level", "-l", help="Set the log level."
+    ),
+    job_name_prefix: Optional[str] = typer.Option(
+        None, "--job-name-prefix", help="Optional prefix for job names."
+    ),
+    restart_run: bool = typer.Option(
+        False, "--restart-run", help="Add --no-output-cleanup flag to mpirun command."
+    ),
+    scenario_continuation: bool = typer.Option(
+        False,
+        "-sc",
+        "--scenario-continuation",
+        help=(
+            "Set restart_from to output/restart-tr.nc and add --no-output-cleanup "
+            "before --max-output-volume in slurm runner."
+        ),
+    ),
+    restart_from: Optional[str] = typer.Option(
+        None,
+        "--restart_from",
+        "--restart-from",
+        help=(
+            "Override IO.restart_from in generated config.js with the exact value "
+            "provided (example: --restart_from \"\")."
+        ),
+    ),
+    mpi_ranks: int = typer.Option(
+        1,
+        "--mpi-ranks",
+        help=(
+            "Number of MPI ranks per batch job. "
+            "Default is 1 to avoid Lustre NetCDF restart write failures."
+        ),
+    ),
+):
+    """
+    Split WIEMIP setup NetCDF files via integrated filter+split.
+
+    The command computes active-cell bbox from run-mask, creates an internal filtered
+    staging dataset (cropped 2D, inactive masked), writes split metadata, and then
+    creates Y-stripe batch inputs for dvmdostem.
+    """
+    all_args = {
+        "slurm_partition": slurm_partition.value,
+        "input_path": input_path,
+        "batches": batches,
+        "nbatches": nbatches,
+        "launch_as_job": launch_as_job,
+        "p": p,
+        "e": e,
+        "s": s,
+        "t": t,
+        "n": n,
+        "log_level": log_level.value,
+        "job_name_prefix": job_name_prefix,
+        "restart_run": restart_run,
+        "scenario_continuation": scenario_continuation,
+        "restart_from": restart_from,
+        "mpi_ranks": mpi_ranks,
+    }
+    args = type("Args", (), all_args)()
+    WiemipSplitCommand(args).execute()
 
 
 @batch_app.command("run")
@@ -307,6 +437,90 @@ def batch_run(
     """Submit the batches to the Slurm queue."""
     args = type("Args", (), {"batches": batches})()
     BatchRunCommand(args).execute()
+
+
+@batch_app.command("wiemip_merge")
+def batch_wiemip_merge(
+    batches: str = typer.Option(
+        ...,
+        "--batches",
+        "-b",
+        help=(
+            "Path to batch folders. The given path is concatenated "
+            "with /mnt/exacloud/$USER"
+        ),
+    ),
+    output_dir_name: str = typer.Option(
+        "wiemip_merged",
+        "--output-dir-name",
+        help=(
+            "Destination folder name under the batch root. "
+            "Contains merged_filtered/ and merged_restored/."
+        ),
+    ),
+):
+    """Merge WIEMIP outputs to filtered space, then restore to full original grid."""
+    args = type(
+        "Args",
+        (),
+        {"batches": batches, "output_dir_name": output_dir_name},
+    )()
+    WiemipMergeCommand(args).execute()
+
+
+@batch_app.command("wiemip_re-run")
+def batch_wiemip_re_run(
+    batch_path: str = typer.Argument(
+        ...,
+        help=(
+            "Path to a single incomplete batch directory (for example "
+            "/mnt/exacloud/$USER/my_batches/batch_17)."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite existing retry directory if it already exists.",
+    ),
+    submit: bool = typer.Option(
+        True,
+        "--submit/--no-submit",
+        help="Submit retry job automatically after preparing retry batch.",
+    ),
+    partition: SlurmPartition = typer.Option(
+        SlurmPartition.dask,
+        "--partition",
+        "-p",
+        help="SLURM partition for retry batch jobs.",
+    ),
+):
+    """Prepare and optionally submit a retry for one WIEMIP batch."""
+    args = type(
+        "Args",
+        (),
+        {
+            "batch_path": batch_path,
+            "force": force,
+            "submit": submit,
+            "partition": partition.value,
+        },
+    )()
+    WiemipReRunCommand(args).execute()
+
+
+@batch_app.command("wiemip_rerun_merge")
+def batch_wiemip_rerun_merge(
+    batch_path: str = typer.Argument(
+        ...,
+        help=(
+            "Path to a single batch directory with retry outputs "
+            "(for example /mnt/exacloud/$USER/my_batches/batch_44)."
+        ),
+    ),
+):
+    """Merge retry output NetCDF files back into one WIEMIP batch output."""
+    args = type("Args", (), {"batch_path": batch_path})()
+    WiemipReRunMergeCommand(args).execute()
 
 
 @batch_app.command("merge")

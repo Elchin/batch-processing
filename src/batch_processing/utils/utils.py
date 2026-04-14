@@ -3,14 +3,13 @@ import json
 import os
 import random
 import re
-import gcsfs
 import string
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 from subprocess import CompletedProcess
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -544,9 +543,25 @@ def submit_job(path: str) -> CompletedProcess:
     return subprocess.run(command, text=True, capture_output=True)
 
 
+def extract_sbatch_job_id(output: str) -> Optional[str]:
+    """Extracts Slurm job id from sbatch output text."""
+    if not output:
+        return None
+    submitted_match = re.search(r"Submitted batch job\s+(\d+)", output)
+    if submitted_match:
+        return submitted_match.group(1)
+    fallback_match = re.search(r"\b(\d{4,})\b", output)
+    if fallback_match:
+        return fallback_match.group(1)
+    return None
+
+
 #def update_config(path: str, prefix_value: str) -> None:
 def update_config(
-    path: str, prefix_value: str, scenario_continuation: bool = False
+    path: str,
+    prefix_value: str,
+    scenario_continuation: bool = False,
+    restart_from: str | None = None,
 ) -> None:
     """Updates the 'IO' section of config.js with new paths.
 
@@ -558,6 +573,7 @@ def update_config(
         path (str): The file system path to the JSON configuration file to be updated.
         prefix_value (str): The new prefix to be added to the paths in the 'IO' section.
         scenario_continuation (bool): If True, set restart_from to output/restart-tr.nc.
+        restart_from (str | None): If provided, set IO.restart_from to this exact value.
 
     Returns:
         None
@@ -568,6 +584,8 @@ def update_config(
             config_data["IO"][key] = f"{prefix_value}/output/restart-tr.nc"
         else:
             config_data["IO"][key] = f"{prefix_value}/{val}"
+    if restart_from is not None:
+        config_data["IO"]["restart_from"] = restart_from
 
     write_json_file(path, config_data)
 
@@ -595,6 +613,8 @@ def create_slurm_script(
 
 
 def get_gcsfs():
+    import gcsfs
+
     return gcsfs.GCSFileSystem(project="spherical-berm-323321", token=None)
 
 

@@ -29,6 +29,10 @@ All of the available commands are:
 * [bp init](#bp-init)
 * [bp tem](#bp-tem)
 * [bp batch split](#bp-batch-split)
+* [bp batch wiemip_split](#bp-batch-wiemip_split)
+* [bp batch wiemip_merge](#bp-batch-wiemip_merge)
+* [bp batch wiemip_re-run](#bp-batch-wiemip_re-run)
+* [bp batch wiemip_rerun_merge](#bp-batch-wiemip_rerun_merge)
 * [bp batch run](#bp-batch-run)
 * [bp batch merge](#bp-batch-merge)
 * [bp batch plot](#bp-batch-plot)
@@ -84,6 +88,110 @@ It takes the following arguments:
 If `bp batch split -i /mnt/exacloud/dvmdostem-input/my-big-input-dataset -b first-run -p 100 -e 1000 -s 85 -t 115 -n 85 --log-level warn` command is run, you should be able to see your batch folders in `/mnt/exacloud/$USER/first-run` where `$USER` is the username of the current logged in user.
 You can check `slurm_runner.sh` to see the details of the job.
 
+### bp batch wiemip_split
+
+Splits WIEMIP setup inputs into **cropped 2D Y-stripe batches** with an integrated
+filtering stage (no external toggle script required for BP workflow).
+
+Workflow:
+
+* Reads original full-grid inputs (for example `Y=360`, `X=720`) and computes active-cell bbox
+  from `run-mask.nc` (`run == 1`).
+* Builds an internal filtered staging set (cropped 2D, inactive cells masked).
+* Splits staged spatial files into contiguous Y stripes (`Y_chunk × X`) for batch inputs.
+* Copies non-spatial files to each batch.
+* Writes `wiemip_split_metadata.json` at batch root; merge depends on it for restore.
+
+Notes:
+
+* Filtered staging files keep canonical `.nc` names and are stored under the batch root.
+* This replaces manual `toggle_active_cells.sh --filtered` usage for BP WIEMIP runs.
+* This also replaces older WIEMIP `active_cell`-flattened split behavior.
+
+Example:
+
+```bash
+bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 -p 10 -e 10 -s 10 -t 10
+```
+
+### bp batch wiemip_merge
+
+Merges WIEMIP batch outputs produced by `bp batch wiemip_split` in two stages.
+
+Behavior:
+
+* Stage A: merge by Y-stripe concatenation into `merged_filtered/`.
+* Stage B: restore each merged filtered file to full original-grid shape (for example
+  `360x720`) into `merged_restored/` using split metadata + original run-mask.
+* Validates that the column dimension (`X`/`x`/`longitude`/`lon`) is consistent across batches.
+* Fails fast if `wiemip_split_metadata.json` is missing.
+
+Example:
+
+```bash
+bp batch wiemip_merge -b test_split --output-dir-name wiemip_merged
+```
+
+Output folders for the above example:
+
+* `/mnt/exacloud/$USER/test_split/wiemip_merged/merged_filtered`
+* `/mnt/exacloud/$USER/test_split/wiemip_merged/merged_restored`
+
+### bp batch wiemip_re-run
+
+Creates a single-batch retry run for WIEMIP outputs by masking out completed cells
+(`run_status == 100`) and keeping only incomplete cells enabled in `run-mask.nc`.
+The retry is prepared under `<batch_path>/retry` and submitted by default.
+
+Behavior:
+
+* Expects one batch folder (for example `/mnt/exacloud/$USER/my_run/batch_17`).
+* Validates required files: `input/run-mask.nc`, `output/run_status.nc`,
+  `config/config.js`, and `slurm_runner.sh`.
+* Creates `<batch_path>/retry` (or replaces it with `--force`), rewrites retry
+  config/slurm paths, and updates retry `run-mask.nc` to run only incomplete cells.
+* Auto-submits `retry/slurm_runner.sh` unless `--no-submit` is used.
+* If no incomplete cells are found, exits without creating or submitting a retry.
+
+Examples:
+
+```bash
+# Prepare and submit retry for one incomplete batch
+bp batch wiemip_re-run /mnt/exacloud/$USER/wiemip_batches/batch_17
+
+# Rebuild retry folder and submit again
+bp batch wiemip_re-run /mnt/exacloud/$USER/wiemip_batches/batch_17 --force
+
+# Prepare retry without submission
+bp batch wiemip_re-run /mnt/exacloud/$USER/wiemip_batches/batch_17 --no-submit
+```
+
+### bp batch wiemip_rerun_merge
+
+Merges retry outputs from `<batch_path>/retry/output/*.nc` back into
+`<batch_path>/output/*.nc` for one WIEMIP batch.
+
+Behavior:
+
+* Expects one batch folder with both original output and retry output folders.
+* Uses partial-merge semantics:
+  * For `run_status.nc`, newly successful retry cells (`run_status == 100`) are
+    written back to original.
+  * Other variables are updated where retry contains valid values.
+* Merges all other retry NetCDF files into original output:
+  * If file does not exist in original output, it is copied from retry.
+  * If file exists, values are merged variable-by-variable.
+  * If merge for a file fails, command falls back to copying retry file.
+* Prints before/after completion summary (`m/n`) based on active cells
+  (`run-mask.nc run == 1`) and reports any remaining incomplete cells.
+
+Example:
+
+```bash
+# Merge retry output files back into one batch output folder
+bp batch wiemip_rerun_merge /mnt/exacloud/$USER/wiemip_batches/batch_44
+```
+
 ### bp batch run
 
 Submits all of the jobs to Slurm in the given batch folder.
@@ -97,6 +205,8 @@ Assuming `bp batch split` is run with `-b first-run`, running `bp batch run -b f
 
 Combines the results of all batches using a hybrid approach that handles missing batches gracefully.
 It should be run after all jobs are finished.
+
+**Note:** `bp batch merge` assumes batches were produced by **`bp batch split`** (one full-`X` strip per batch, merged by concatenating along `y` or `Y`).
 It takes the following arguments:
 
 * `-b/--batches`: Path that stores job folders. Required.
