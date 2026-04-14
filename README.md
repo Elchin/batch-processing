@@ -107,11 +107,20 @@ Notes:
 * Filtered staging files keep canonical `.nc` names and are stored under the batch root.
 * This replaces manual `toggle_active_cells.sh --filtered` usage for BP WIEMIP runs.
 * This also replaces older WIEMIP `active_cell`-flattened split behavior.
+* By default, split also **pre-filters each batch `run-mask.nc`** after Y-stripe split:
+  active cells are disabled (`run=0`) where required climate forcing vars are invalid
+  (`tair`, `vapor_press`, `precip`, `nirr`; especially negative/sentinel `nirr`).
+* Disable this safety step with `--no-runmask-prefilter`.
 
 Example:
 
 ```bash
 bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 -p 10 -e 10 -s 10 -t 10
+```
+
+```bash
+# Optional: skip run-mask prefilter pass
+bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 --no-runmask-prefilter
 ```
 
 ### bp batch wiemip_merge

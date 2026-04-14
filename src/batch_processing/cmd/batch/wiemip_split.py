@@ -36,6 +36,10 @@ RUN_MASK_DESTINATION = "run-mask.nc"
 OUTPUT_ROW_DIM = "Y"
 OUTPUT_COL_DIM = "X"
 OUTPUT_NETCDF_FORMAT = "NETCDF4_CLASSIC"
+CLIMATE_INPUT_FILENAMES = ("historic-climate.nc", "projected-climate.nc")
+REQUIRED_CLIMATE_VARS = ("tair", "vapor_press", "precip", "nirr")
+NONNEGATIVE_CLIMATE_VARS = ("vapor_press", "precip", "nirr")
+MISSING_SENTINEL_THRESHOLD = -900.0
 
 
 class WiemipSplitCommand(BatchSplitCommand):
@@ -277,6 +281,130 @@ class WiemipSplitCommand(BatchSplitCommand):
                     f"expected {expected_cols}."
                 )
 
+    def _compute_invalid_spatial_mask(
+        self, da: xr.DataArray, row_dim: str, col_dim: str, var_name: str
+    ) -> xr.DataArray:
+        if row_dim not in da.dims or col_dim not in da.dims:
+            raise ValueError(
+                f"Climate variable '{var_name}' must include '{row_dim}' and "
+                f"'{col_dim}' dims. Found {tuple(da.dims)}."
+            )
+
+        invalid = ~np.isfinite(da)
+        invalid = invalid | (da <= MISSING_SENTINEL_THRESHOLD)
+        if var_name in NONNEGATIVE_CLIMATE_VARS:
+            invalid = invalid | (da < 0)
+
+        reduce_dims = [d for d in da.dims if d not in (row_dim, col_dim)]
+        if reduce_dims:
+            invalid = invalid.any(dim=reduce_dims)
+        return invalid.transpose(row_dim, col_dim)
+
+    def _prefilter_batch_run_mask(
+        self, batch_input_dir: Path, required_vars: tuple[str, ...]
+    ) -> dict[str, int]:
+        run_mask_file = batch_input_dir / RUN_MASK_DESTINATION
+        if not run_mask_file.exists():
+            raise FileNotFoundError(f"Missing run-mask for prefilter: {run_mask_file}")
+
+        climate_files = [
+            batch_input_dir / fname
+            for fname in CLIMATE_INPUT_FILENAMES
+            if (batch_input_dir / fname).exists()
+        ]
+        if not climate_files:
+            raise FileNotFoundError(
+                f"No climate files found in {batch_input_dir}. "
+                f"Expected one of {CLIMATE_INPUT_FILENAMES}."
+            )
+
+        with open_dataset_for_read(run_mask_file) as run_mask_ds:
+            run_mask_da, row_dim, col_dim = extract_run_mask_2d(
+                run_mask_ds, run_mask_file.name, run_var=RUN_MASK_VARIABLE
+            )
+            active_before = np.isfinite(run_mask_da) & np.isclose(
+                run_mask_da, RUN_ENABLED_VALUE
+            )
+            active_before_count = int(active_before.sum().item())
+
+            invalid_any = xr.zeros_like(run_mask_da, dtype=bool)
+            for climate_file in climate_files:
+                with open_dataset_for_read(climate_file) as climate_ds:
+                    missing_vars = [name for name in required_vars if name not in climate_ds]
+                    if missing_vars:
+                        raise KeyError(
+                            f"{climate_file} missing required climate vars: {missing_vars}"
+                        )
+                    for var_name in required_vars:
+                        invalid_mask = self._compute_invalid_spatial_mask(
+                            da=climate_ds[var_name],
+                            row_dim=row_dim,
+                            col_dim=col_dim,
+                            var_name=var_name,
+                        )
+                        invalid_any = invalid_any | invalid_mask
+
+            disable_mask = active_before & invalid_any
+            disabled_count = int(disable_mask.sum().item())
+            active_after_count = active_before_count - disabled_count
+
+            if disabled_count == 0:
+                return {
+                    "active_before": active_before_count,
+                    "active_after": active_after_count,
+                    "disabled": disabled_count,
+                    "checked_files": len(climate_files),
+                }
+
+            updated_values = np.where(
+                active_before.values & ~disable_mask.values, RUN_ENABLED_VALUE, 0
+            ).astype(run_mask_da.dtype, copy=False)
+            run_mask_out = run_mask_ds.copy(deep=True)
+            run_mask_out[RUN_MASK_VARIABLE] = xr.DataArray(
+                updated_values,
+                dims=run_mask_da.dims,
+                coords=run_mask_da.coords,
+                attrs=run_mask_da.attrs.copy(),
+            )
+            tmp_path = run_mask_file.with_suffix(".tmp.nc")
+            run_mask_out.to_netcdf(
+                tmp_path.as_posix(),
+                engine="netcdf4",
+                format=OUTPUT_NETCDF_FORMAT,
+            )
+            run_mask_out.close()
+
+        tmp_path.replace(run_mask_file)
+        return {
+            "active_before": active_before_count,
+            "active_after": active_after_count,
+            "disabled": disabled_count,
+            "checked_files": len(climate_files),
+        }
+
+    def _prefilter_split_run_masks(
+        self, batch_input_dirs: List[Path], required_vars: tuple[str, ...]
+    ) -> None:
+        total_disabled = 0
+        batches_changed = 0
+        for batch_index, batch_input_dir in enumerate(batch_input_dirs, start=1):
+            result = self._prefilter_batch_run_mask(
+                batch_input_dir=batch_input_dir, required_vars=required_vars
+            )
+            total_disabled += result["disabled"]
+            if result["disabled"] > 0:
+                batches_changed += 1
+            print(
+                "  [runmask-prefilter] "
+                f"{batch_input_dir.parent.name} ({batch_index}/{len(batch_input_dirs)}): "
+                f"active {result['active_before']} -> {result['active_after']} "
+                f"(disabled {result['disabled']}, climate files {result['checked_files']})"
+            )
+        print(
+            "[runmask-prefilter] Done: "
+            f"disabled {total_disabled} active cells across {batches_changed} batches."
+        )
+
     def execute(self) -> None:
         print("[wiemip_split] Starting integrated WIEMIP split workflow")
         if str(self.input_path).startswith("gcs://"):
@@ -293,6 +421,8 @@ class WiemipSplitCommand(BatchSplitCommand):
         if nbatches < 1:
             raise ValueError("nbatches must be >= 1")
         print(f"[wiemip_split] Requested batch count: {nbatches}")
+        runmask_prefilter = bool(getattr(self._args, "runmask_prefilter", True))
+        print(f"[wiemip_split] Run-mask prefilter: {runmask_prefilter}")
 
         print("[wiemip_split:1/8] Discovering run-mask source")
         _, _, run_mask_source = self._discover_inputs(input_path)
@@ -445,7 +575,24 @@ class WiemipSplitCommand(BatchSplitCommand):
                 expected_cols=bbox_cols,
             )
 
-        print("[wiemip_split:8/8] Creating runnable batch workdirs and configs")
+        if runmask_prefilter:
+            print(
+                "[wiemip_split:8/9] Pre-filtering split run-mask files "
+                "using required climate vars"
+            )
+            self._prefilter_split_run_masks(
+                batch_input_dirs=batch_input_dirs,
+                required_vars=REQUIRED_CLIMATE_VARS,
+            )
+            setup_step = "[wiemip_split:9/9]"
+        else:
+            print(
+                "[wiemip_split] Skipping run-mask prefilter due to "
+                "--no-runmask-prefilter."
+            )
+            setup_step = "[wiemip_split:8/8]"
+
+        print(f"{setup_step} Creating runnable batch workdirs and configs")
         print("Setting up batch simulation folders")
         for batch_dir, batch_input_dir in zip(batch_dirs, batch_input_dirs):
             self._run_utils(batch_dir, batch_input_dir)

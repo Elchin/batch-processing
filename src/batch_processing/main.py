@@ -392,6 +392,14 @@ def batch_wiemip_split(
             "Default is 1 to avoid Lustre NetCDF restart write failures."
         ),
     ),
+    runmask_prefilter: bool = typer.Option(
+        True,
+        "--runmask-prefilter/--no-runmask-prefilter",
+        help=(
+            "After split, disable run-mask cells where required climate forcing vars "
+            "(tair, vapor_press, precip, nirr) are invalid. Enabled by default."
+        ),
+    ),
 ):
     """
     Split WIEMIP setup NetCDF files via integrated filter+split.
@@ -417,6 +425,7 @@ def batch_wiemip_split(
         "scenario_continuation": scenario_continuation,
         "restart_from": restart_from,
         "mpi_ranks": mpi_ranks,
+        "runmask_prefilter": runmask_prefilter,
     }
     args = type("Args", (), all_args)()
     WiemipSplitCommand(args).execute()

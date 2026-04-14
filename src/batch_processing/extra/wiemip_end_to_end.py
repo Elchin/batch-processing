@@ -342,6 +342,22 @@ def main() -> None:
         help="TRANSIENT years for split setup (default: 10).",
     )
     parser.add_argument(
+        "--runmask-prefilter",
+        dest="runmask_prefilter",
+        action="store_true",
+        default=True,
+        help=(
+            "Enable WIEMIP split run-mask prefilter (default): disable active cells "
+            "where required climate forcing vars are invalid."
+        ),
+    )
+    parser.add_argument(
+        "--no-runmask-prefilter",
+        dest="runmask_prefilter",
+        action="store_false",
+        help="Disable WIEMIP split run-mask prefilter.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands and skip execution.",
@@ -391,6 +407,8 @@ def main() -> None:
     ]
     if args.slurm_partition:
         split_cmd.extend(["-sp", args.slurm_partition])
+    if not args.runmask_prefilter:
+        split_cmd.append("--no-runmask-prefilter")
     run_cmd(split_cmd, dry_run=args.dry_run)
 
     # Step 2: Submit all batches.
