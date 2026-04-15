@@ -38,52 +38,7 @@ You will repeat this for each model, for example:
 
 ### Step 3. Reduce file size if needed
 
-After processing, the output file may be larger than necessary. If needed, reduce file size by masking unused grid cells and/or saving with compression.
-
-### Option A. Apply a mask with Python
-
-```python
-import xarray as xr
-
-# Open processed climate file
-ds = xr.open_dataset("processed_climate.nc")
-
-# Open mask file if available
-mask_ds = xr.open_dataset("mask.nc")
-
-# Replace 'mask_var' with the actual mask variable name
-mask = mask_ds["mask_var"] == 1
-
-# Apply mask
-ds_masked = ds.where(mask)
-
-# Save masked output
-ds_masked.to_netcdf("processed_climate_masked.nc")
-```
-
-If the mask already exists inside the processed dataset, you can do:
-
-```python
-import xarray as xr
-
-ds = xr.open_dataset("processed_climate.nc")
-
-# Replace 'mask_var' with the correct variable name
-ds_masked = ds.where(ds["mask_var"] == 1)
-
-ds_masked.to_netcdf("processed_climate_masked.nc")
-```
-
-### Option B. Save with compression
-
-```python
-import xarray as xr
-
-ds = xr.open_dataset("processed_climate.nc")
-
-encoding = {var: {"zlib": True, "complevel": 4} for var in ds.data_vars}
-ds.to_netcdf("processed_climate_compressed.nc", encoding=encoding)
-```
+After processing, the output file may be larger than necessary. If needed, reduce file size by masking unused grid cells and/or saving with compression. [I will add this section later]
 
 ### Step 4. Give the processed file a meaningful name
 
@@ -135,7 +90,7 @@ cd /mnt/<yourname>_woodwellclimate_org/wiemip
 Example:
 
 ```bash
-cd /mnt/ejafarov_woodwellclimate_org/wiemip
+cd /mnt/yourname_woodwellclimate_org/wiemip
 ```
 
 ### Step 4. Copy the setup files from the bucket
@@ -195,13 +150,10 @@ Example:
 
 ```bash
 python ~/batch-processing/src/batch_processing/extra/wiemip_end_to_end.py \
-  --input /mnt/exacloud/ejafarov_woodwellclimate_org/wiemip/setup_GFDL-ESM4 \
-  --split /mnt/exacloud/ejafarov_woodwellclimate_org/wiemip/test_gfdl_split_3 \
+  --input /mnt/exacloud/yourname_woodwellclimate_org/wiemip/setup_GFDL-ESM4 \
+  --split /mnt/exacloud/yourname_woodwellclimate_org/wiemip/test_gfdl_split_3 \
   -sp dask \
-  -p 10 \
-  -e 10 \
-  -s 10 \
-  -t 10
+  -p 10 -e 10 -s 10 -t 10
 ```
 
 ### Step 3. Meaning of the key arguments
@@ -265,7 +217,7 @@ cd batch-processing
 git checkout wiemip
 
 # Move to WIEMIP workspace
-cd /mnt/ejafarov_woodwellclimate_org/wiemip
+cd /mnt/yourname_woodwellclimate_org/wiemip
 
 # Copy updated setup files
 gsutil -m cp -r gs://wiemip/setup_05deg_updated .
@@ -276,13 +228,10 @@ cp historic-climate-UKESM.nc historic-climate.nc
 
 # Run a short test on Dask
 python ~/batch-processing/src/batch_processing/extra/wiemip_end_to_end.py \
-  --input /mnt/exacloud/ejafarov_woodwellclimate_org/wiemip/setup_05deg_updated \
-  --split /mnt/exacloud/ejafarov_woodwellclimate_org/wiemip/test_ukesm_split_3 \
+  --input /mnt/exacloud/yourname_woodwellclimate_org/wiemip/setup_05deg_updated \
+  --split /mnt/exacloud/yourname_woodwellclimate_org/wiemip/test_ukesm_split_3 \
   -sp dask \
-  -p 10 \
-  -e 10 \
-  -s 10 \
-  -t 10
+  -p 10 -e 10 -s 10 -t 10
 ```
 
 ---
