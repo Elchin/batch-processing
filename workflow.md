@@ -38,7 +38,10 @@ You will repeat this for each model, for example:
 
 ### Step 3. Reduce file size if needed
 
-After processing, the output file may be larger than necessary. If needed, reduce file size by masking unused grid cells and/or saving with compression. [I will add this section later]
+After processing, the historic-climate file is about 7.1Gb. Reduce file size by masking unused grid cells. For example, for the UKESM model:
+```bash
+python masking/apply_run_mask_to_climate.py path-to/setup_05deg_updated/run-mask.nc tem_UKES_output/historic-climate-UKESM1-0-LL.nc tem_UKES_output/historic-climate-UKESM1-0-LL-masked.nc
+```
 
 ### Step 4. Give the processed file a meaningful name
 
