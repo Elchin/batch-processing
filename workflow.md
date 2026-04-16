@@ -27,7 +27,7 @@ cd wiemip_tem_input_conversion
 
 ### Step 2. Follow the example in the repository README
 
-Use the example provided in the `README` as the template for processing each dataset.  
+Use the example provided in the [README](https://github.com/whrc/wiemip_tem_input_conversion) as the template for processing each dataset.  
 Each WIEMIP climate model should be processed using the same workflow.
 
 You will repeat this for each model, for example:
