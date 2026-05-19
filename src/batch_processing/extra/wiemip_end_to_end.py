@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -405,6 +407,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--restart_from",
+        "--restart-from",
+        dest="restart_from",
+        default=None,
+        help=(
+            "Base path of the source split run to copy restart files from. "
+            "For each batch_x found there, <restart_file> will be copied from "
+            "batch_x/output/ into the corresponding new batch_x/output/ and "
+            "config.js will be updated to point at it. "
+            "Example: mnt/exacloud/cchang_woodwellclimate_org/wiemip/stable_split_veg1"
+        ),
+    )
+    parser.add_argument(
+        "--restart_file",
+        "--restart-file",
+        dest="restart_file",
+        default="restart-sp.nc",
+        help="Filename of the restart file to copy from each source batch_x/output/ (default: restart-sp.nc).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands and skip execution.",
@@ -421,6 +443,10 @@ def main() -> None:
         raise FileNotFoundError(f"Input run-mask missing: {input_path / 'run-mask.nc'}")
     if args.poll_seconds < 1:
         raise ValueError("--poll-seconds must be >= 1")
+    if args.restart_from:
+        restart_from_path = normalize_path(args.restart_from)
+        if not restart_from_path.exists():
+            raise FileNotFoundError(f"--restart_from path does not exist: {restart_from_path}")
 
     print(f"[INFO] Input path: {input_path}")
     print(f"[INFO] Split path: {split_path}")
@@ -463,6 +489,40 @@ def main() -> None:
     else:
         split_cmd.extend(["--max-cmt", str(args.max_cmt)])
     run_cmd(split_cmd, dry_run=args.dry_run)
+
+    # Step 1.5: Seed restart files from source split run into new batch output dirs.
+    if args.restart_from:
+        restart_from_path = normalize_path(args.restart_from)
+        source_batch_dirs = get_batch_dirs(restart_from_path)
+        if not source_batch_dirs:
+            raise FileNotFoundError(f"No batch_x dirs found under {restart_from_path}")
+        print(
+            f"[STEP 1.5] Seeding '{args.restart_file}' from {restart_from_path} "
+            f"({len(source_batch_dirs)} batches)"
+        )
+        for src_batch_dir in source_batch_dirs:
+            batch_id = batch_id_from_path(src_batch_dir)
+            src_restart = src_batch_dir / "output" / args.restart_file
+            if not src_restart.exists():
+                print(f"[WARN] Missing {args.restart_file} for batch_{batch_id}: {src_restart}")
+                continue
+            dst_batch_dir = split_path / f"batch_{batch_id}"
+            dst_output_dir = dst_batch_dir / "output"
+            dst_output_dir.mkdir(parents=True, exist_ok=True)
+            dst_restart = dst_output_dir / args.restart_file
+            if not args.dry_run:
+                shutil.copy2(src_restart, dst_restart)
+            config_file = dst_batch_dir / "config" / "config.js"
+            if not config_file.exists():
+                print(f"[WARN] config.js missing for batch_{batch_id}: {config_file}")
+                continue
+            if not args.dry_run:
+                with open(config_file) as fh:
+                    config_data = json.load(fh)
+                config_data["IO"]["restart_from"] = dst_restart.as_posix()
+                with open(config_file, "w") as fh:
+                    json.dump(config_data, fh, indent=4)
+            print(f"[RESTART] batch_{batch_id}: {src_restart} -> {dst_restart}")
 
     # Step 2: Submit all batches.
     run_cmd(["bp", "batch", "run", "-b", split_path.as_posix()], dry_run=args.dry_run)
