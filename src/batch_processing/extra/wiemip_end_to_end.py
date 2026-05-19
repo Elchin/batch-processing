@@ -24,6 +24,17 @@ DEFAULT_PLOT_SCRIPT = os.path.expanduser(
 )
 DEFAULT_SPLIT_PARTITION = ""
 RUN_MASK_VAR = "run"
+
+
+def _max_cmt_arg_type(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--max-cmt requires an integer (got {value!r})"
+        ) from exc
+
+
 RUN_STATUS_VAR = "run_status"
 RUN_SUCCESS_VALUE = 100
 RUN_ENABLED_VALUE = 1
@@ -358,6 +369,42 @@ def main() -> None:
         help="Disable WIEMIP split run-mask prefilter.",
     )
     parser.add_argument(
+        "--cmt0-filter",
+        dest="cmt0_filter",
+        action="store_true",
+        help=(
+            "Enable WIEMIP split cmt0 run-mask prefilter: disable active cells "
+            "where veg_class==0 in vegetation.nc."
+        ),
+    )
+    parser.add_argument(
+        "--no-cmt0-filter",
+        dest="cmt0_filter",
+        action="store_false",
+        help="Disable WIEMIP split cmt0 run-mask prefilter (default).",
+    )
+    parser.set_defaults(cmt0_filter=False)
+    parser.add_argument(
+        "--no-max-cmt",
+        dest="no_max_cmt",
+        action="store_true",
+        help=(
+            "Disable WIEMIP split max-CMT run-mask prefilter "
+            "(veg_class > N in vegetation.nc)."
+        ),
+    )
+    parser.add_argument(
+        "--max-cmt",
+        dest="max_cmt",
+        type=_max_cmt_arg_type,
+        default=74,
+        metavar="N",
+        help=(
+            "WIEMIP split: disable active cells where veg_class > N in vegetation.nc "
+            "(runs after climate and --cmt0-filter prefilters). Default N is 74."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands and skip execution.",
@@ -409,6 +456,12 @@ def main() -> None:
         split_cmd.extend(["-sp", args.slurm_partition])
     if not args.runmask_prefilter:
         split_cmd.append("--no-runmask-prefilter")
+    if args.cmt0_filter:
+        split_cmd.append("--cmt0-filter")
+    if args.no_max_cmt:
+        split_cmd.append("--no-max-cmt")
+    else:
+        split_cmd.extend(["--max-cmt", str(args.max_cmt)])
     run_cmd(split_cmd, dry_run=args.dry_run)
 
     # Step 2: Submit all batches.

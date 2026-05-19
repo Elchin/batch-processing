@@ -111,6 +111,12 @@ Notes:
   active cells are disabled (`run=0`) where required climate forcing vars are invalid
   (`tair`, `vapor_press`, `precip`, `nirr`; especially negative/sentinel `nirr`).
 * Disable this safety step with `--no-runmask-prefilter`.
+* Optional: after split, disable active cells where `vegetation.nc` has `veg_class==0`
+  using `--cmt0-filter` (off by default).
+* By default, split also applies a **max-CMT run-mask prefilter** after the climate
+  (and optional `--cmt0-filter`) steps: active cells are disabled where `veg_class > N`
+  in `vegetation.nc`, with **N=74** unless you pass `--max-cmt N`. Disable with
+  `--no-max-cmt`.
 
 Example:
 
@@ -121,6 +127,21 @@ bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_
 ```bash
 # Optional: skip run-mask prefilter pass
 bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 --no-runmask-prefilter
+```
+
+```bash
+# Optional: also disable runs where veg_class is 0 (after any climate prefilter)
+bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 --cmt0-filter
+```
+
+```bash
+# Default max-CMT prefilter uses N=74; override threshold
+bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 --max-cmt 5
+```
+
+```bash
+# Disable max-CMT prefilter (veg_class > N)
+bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 --no-max-cmt
 ```
 
 ### bp batch wiemip_merge

@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import typer
 from typing import Optional
 from enum import Enum
@@ -92,6 +93,53 @@ app = typer.Typer(
 
 batch_app = typer.Typer(help="Batch related operations")
 app.add_typer(batch_app, name="batch")
+
+_DEFAULT_MAX_CMT = 74
+_MAX_CMT_ARG_REMINDER = (
+    "--max-cmt requires an integer threshold N (for example --max-cmt 5). "
+    "Cells where veg_class > N are disabled in each batch run-mask. "
+    f"Omit --max-cmt to use the default ({_DEFAULT_MAX_CMT})."
+)
+
+
+def _require_max_cmt_argv_has_int() -> None:
+    """Exit with a reminder if --max-cmt is present with an invalid integer value."""
+    argv = sys.argv
+    for i, raw in enumerate(argv):
+        if raw == "--max-cmt":
+            if i + 1 >= len(argv):
+                typer.secho(
+                    f"Missing value for --max-cmt. {_MAX_CMT_ARG_REMINDER}",
+                    err=True,
+                )
+                raise typer.Exit(2)
+            try:
+                int(argv[i + 1])
+            except ValueError:
+                typer.secho(
+                    f"Invalid value for --max-cmt: {argv[i + 1]!r}. "
+                    f"{_MAX_CMT_ARG_REMINDER}",
+                    err=True,
+                )
+                raise typer.Exit(2)
+            return
+        if raw.startswith("--max-cmt="):
+            value = raw.split("=", 1)[1]
+            if value == "":
+                typer.secho(
+                    f"Missing value for --max-cmt. {_MAX_CMT_ARG_REMINDER}",
+                    err=True,
+                )
+                raise typer.Exit(2)
+            try:
+                int(value)
+            except ValueError:
+                typer.secho(
+                    f"Invalid value for --max-cmt: {value!r}. {_MAX_CMT_ARG_REMINDER}",
+                    err=True,
+                )
+                raise typer.Exit(2)
+            return
 
 
 @app.callback()
@@ -400,6 +448,31 @@ def batch_wiemip_split(
             "(tair, vapor_press, precip, nirr) are invalid. Enabled by default."
         ),
     ),
+    cmt0_filter: bool = typer.Option(
+        False,
+        "--cmt0-filter/--no-cmt0-filter",
+        help=(
+            "After split, disable run-mask cells where vegetation.nc veg_class==0 "
+            "(CMT 0). Off by default."
+        ),
+    ),
+    max_cmt: int = typer.Option(
+        _DEFAULT_MAX_CMT,
+        "--max-cmt",
+        metavar="N",
+        help=(
+            "After split, disable run-mask cells where vegetation.nc veg_class > N. "
+            f"Default threshold is {_DEFAULT_MAX_CMT}; omit this flag to use that default."
+        ),
+    ),
+    no_max_cmt: bool = typer.Option(
+        False,
+        "--no-max-cmt",
+        help=(
+            "Disable the max-CMT run-mask prefilter (veg_class > N). "
+            "By default the prefilter runs with the --max-cmt threshold."
+        ),
+    ),
 ):
     """
     Split WIEMIP setup NetCDF files via integrated filter+split.
@@ -408,6 +481,7 @@ def batch_wiemip_split(
     staging dataset (cropped 2D, inactive masked), writes split metadata, and then
     creates Y-stripe batch inputs for dvmdostem.
     """
+    _require_max_cmt_argv_has_int()
     all_args = {
         "slurm_partition": slurm_partition.value,
         "input_path": input_path,
@@ -426,6 +500,9 @@ def batch_wiemip_split(
         "restart_from": restart_from,
         "mpi_ranks": mpi_ranks,
         "runmask_prefilter": runmask_prefilter,
+        "cmt0_filter": cmt0_filter,
+        "max_cmt": max_cmt,
+        "no_max_cmt": no_max_cmt,
     }
     args = type("Args", (), all_args)()
     WiemipSplitCommand(args).execute()

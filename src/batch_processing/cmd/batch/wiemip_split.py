@@ -33,6 +33,8 @@ WIEMIP_NAME_ALIASES = {
 }
 MASKED_SUFFIX = "_masked.nc"
 RUN_MASK_DESTINATION = "run-mask.nc"
+VEGETATION_DESTINATION = "vegetation.nc"
+VEG_CLASS_VARIABLE = "veg_class"
 OUTPUT_ROW_DIM = "Y"
 OUTPUT_COL_DIM = "X"
 OUTPUT_NETCDF_FORMAT = "NETCDF4_CLASSIC"
@@ -300,6 +302,66 @@ class WiemipSplitCommand(BatchSplitCommand):
             invalid = invalid.any(dim=reduce_dims)
         return invalid.transpose(row_dim, col_dim)
 
+    def _compute_veg_class_zero_mask(
+        self, da: xr.DataArray, row_dim: str, col_dim: str, var_name: str
+    ) -> xr.DataArray:
+        if row_dim not in da.dims or col_dim not in da.dims:
+            raise ValueError(
+                f"Vegetation variable '{var_name}' must include '{row_dim}' and "
+                f"'{col_dim}' dims. Found {tuple(da.dims)}."
+            )
+
+        da_work = da
+        for dim_name in list(da_work.dims):
+            if dim_name in (row_dim, col_dim):
+                continue
+            sz = int(da_work.sizes[dim_name])
+            if sz == 1:
+                da_work = da_work.isel({dim_name: 0}, drop=True)
+            elif sz < 1:
+                raise ValueError(
+                    f"{var_name}: dimension '{dim_name}' has invalid size {sz}."
+                )
+
+        zero = da_work == 0
+        reduce_dims = [d for d in zero.dims if d not in (row_dim, col_dim)]
+        if reduce_dims:
+            zero = zero.any(dim=reduce_dims)
+        return zero.transpose(row_dim, col_dim)
+
+    def _compute_veg_class_gt_mask(
+        self,
+        da: xr.DataArray,
+        row_dim: str,
+        col_dim: str,
+        var_name: str,
+        max_cmt: int,
+    ) -> xr.DataArray:
+        if row_dim not in da.dims or col_dim not in da.dims:
+            raise ValueError(
+                f"Vegetation variable '{var_name}' must include '{row_dim}' and "
+                f"'{col_dim}' dims. Found {tuple(da.dims)}."
+            )
+
+        da_work = da
+        for dim_name in list(da_work.dims):
+            if dim_name in (row_dim, col_dim):
+                continue
+            sz = int(da_work.sizes[dim_name])
+            if sz == 1:
+                da_work = da_work.isel({dim_name: 0}, drop=True)
+            elif sz < 1:
+                raise ValueError(
+                    f"{var_name}: dimension '{dim_name}' has invalid size {sz}."
+                )
+
+        # NaN > N is False: those cells are not disabled by this rule.
+        high = da_work > max_cmt
+        reduce_dims = [d for d in high.dims if d not in (row_dim, col_dim)]
+        if reduce_dims:
+            high = high.any(dim=reduce_dims)
+        return high.transpose(row_dim, col_dim)
+
     def _prefilter_batch_run_mask(
         self, batch_input_dir: Path, required_vars: tuple[str, ...]
     ) -> dict[str, int]:
@@ -405,6 +467,200 @@ class WiemipSplitCommand(BatchSplitCommand):
             f"disabled {total_disabled} active cells across {batches_changed} batches."
         )
 
+    def _prefilter_batch_run_mask_cmt0(self, batch_input_dir: Path) -> dict[str, int]:
+        run_mask_file = batch_input_dir / RUN_MASK_DESTINATION
+        vegetation_file = batch_input_dir / VEGETATION_DESTINATION
+        if not run_mask_file.exists():
+            raise FileNotFoundError(f"Missing run-mask for cmt0-filter: {run_mask_file}")
+        if not vegetation_file.exists():
+            raise FileNotFoundError(
+                f"Missing vegetation for cmt0-filter: {vegetation_file}"
+            )
+
+        with open_dataset_for_read(run_mask_file) as run_mask_ds:
+            run_mask_da, row_dim, col_dim = extract_run_mask_2d(
+                run_mask_ds, run_mask_file.name, run_var=RUN_MASK_VARIABLE
+            )
+            active_before = np.isfinite(run_mask_da) & np.isclose(
+                run_mask_da, RUN_ENABLED_VALUE
+            )
+            active_before_count = int(active_before.sum().item())
+
+            with open_dataset_for_read(vegetation_file) as veg_ds:
+                if VEG_CLASS_VARIABLE not in veg_ds:
+                    raise KeyError(
+                        f"{vegetation_file} missing '{VEG_CLASS_VARIABLE}' variable."
+                    )
+                veg_zero = self._compute_veg_class_zero_mask(
+                    veg_ds[VEG_CLASS_VARIABLE],
+                    row_dim=row_dim,
+                    col_dim=col_dim,
+                    var_name=VEG_CLASS_VARIABLE,
+                )
+
+            if veg_zero.sizes != run_mask_da.sizes:
+                raise ValueError(
+                    f"veg_class grid {dict(veg_zero.sizes)} does not match "
+                    f"run grid {dict(run_mask_da.sizes)} in {batch_input_dir}."
+                )
+
+            disable_mask = active_before & veg_zero
+            disabled_count = int(disable_mask.sum().item())
+            active_after_count = active_before_count - disabled_count
+
+            if disabled_count == 0:
+                return {
+                    "active_before": active_before_count,
+                    "active_after": active_after_count,
+                    "disabled": disabled_count,
+                }
+
+            updated_values = np.where(
+                active_before.values & ~disable_mask.values, RUN_ENABLED_VALUE, 0
+            ).astype(run_mask_da.dtype, copy=False)
+            run_mask_out = run_mask_ds.copy(deep=True)
+            run_mask_out[RUN_MASK_VARIABLE] = xr.DataArray(
+                updated_values,
+                dims=run_mask_da.dims,
+                coords=run_mask_da.coords,
+                attrs=run_mask_da.attrs.copy(),
+            )
+            tmp_path = run_mask_file.with_suffix(".tmp.nc")
+            run_mask_out.to_netcdf(
+                tmp_path.as_posix(),
+                engine="netcdf4",
+                format=OUTPUT_NETCDF_FORMAT,
+            )
+            run_mask_out.close()
+
+        tmp_path.replace(run_mask_file)
+        return {
+            "active_before": active_before_count,
+            "active_after": active_after_count,
+            "disabled": disabled_count,
+        }
+
+    def _prefilter_split_run_masks_cmt0(self, batch_input_dirs: List[Path]) -> None:
+        total_disabled = 0
+        batches_changed = 0
+        for batch_index, batch_input_dir in enumerate(batch_input_dirs, start=1):
+            result = self._prefilter_batch_run_mask_cmt0(batch_input_dir=batch_input_dir)
+            total_disabled += result["disabled"]
+            if result["disabled"] > 0:
+                batches_changed += 1
+            print(
+                "  [cmt0-filter] "
+                f"{batch_input_dir.parent.name} ({batch_index}/{len(batch_input_dirs)}): "
+                f"active {result['active_before']} -> {result['active_after']} "
+                f"(disabled {result['disabled']})"
+            )
+        print(
+            "[cmt0-filter] Done: "
+            f"disabled {total_disabled} active cells across {batches_changed} batches."
+        )
+
+    def _prefilter_batch_run_mask_max_cmt(
+        self, batch_input_dir: Path, max_cmt: int
+    ) -> dict[str, int]:
+        run_mask_file = batch_input_dir / RUN_MASK_DESTINATION
+        vegetation_file = batch_input_dir / VEGETATION_DESTINATION
+        if not run_mask_file.exists():
+            raise FileNotFoundError(
+                f"Missing run-mask for max-cmt filter: {run_mask_file}"
+            )
+        if not vegetation_file.exists():
+            raise FileNotFoundError(
+                f"Missing vegetation for max-cmt filter: {vegetation_file}"
+            )
+
+        with open_dataset_for_read(run_mask_file) as run_mask_ds:
+            run_mask_da, row_dim, col_dim = extract_run_mask_2d(
+                run_mask_ds, run_mask_file.name, run_var=RUN_MASK_VARIABLE
+            )
+            active_before = np.isfinite(run_mask_da) & np.isclose(
+                run_mask_da, RUN_ENABLED_VALUE
+            )
+            active_before_count = int(active_before.sum().item())
+
+            with open_dataset_for_read(vegetation_file) as veg_ds:
+                if VEG_CLASS_VARIABLE not in veg_ds:
+                    raise KeyError(
+                        f"{vegetation_file} missing '{VEG_CLASS_VARIABLE}' variable."
+                    )
+                veg_high = self._compute_veg_class_gt_mask(
+                    veg_ds[VEG_CLASS_VARIABLE],
+                    row_dim=row_dim,
+                    col_dim=col_dim,
+                    var_name=VEG_CLASS_VARIABLE,
+                    max_cmt=max_cmt,
+                )
+
+            if veg_high.sizes != run_mask_da.sizes:
+                raise ValueError(
+                    f"veg_class grid {dict(veg_high.sizes)} does not match "
+                    f"run grid {dict(run_mask_da.sizes)} in {batch_input_dir}."
+                )
+
+            disable_mask = active_before & veg_high
+            disabled_count = int(disable_mask.sum().item())
+            active_after_count = active_before_count - disabled_count
+
+            if disabled_count == 0:
+                return {
+                    "active_before": active_before_count,
+                    "active_after": active_after_count,
+                    "disabled": disabled_count,
+                }
+
+            updated_values = np.where(
+                active_before.values & ~disable_mask.values, RUN_ENABLED_VALUE, 0
+            ).astype(run_mask_da.dtype, copy=False)
+            run_mask_out = run_mask_ds.copy(deep=True)
+            run_mask_out[RUN_MASK_VARIABLE] = xr.DataArray(
+                updated_values,
+                dims=run_mask_da.dims,
+                coords=run_mask_da.coords,
+                attrs=run_mask_da.attrs.copy(),
+            )
+            tmp_path = run_mask_file.with_suffix(".tmp.nc")
+            run_mask_out.to_netcdf(
+                tmp_path.as_posix(),
+                engine="netcdf4",
+                format=OUTPUT_NETCDF_FORMAT,
+            )
+            run_mask_out.close()
+
+        tmp_path.replace(run_mask_file)
+        return {
+            "active_before": active_before_count,
+            "active_after": active_after_count,
+            "disabled": disabled_count,
+        }
+
+    def _prefilter_split_run_masks_max_cmt(
+        self, batch_input_dirs: List[Path], max_cmt: int
+    ) -> None:
+        total_disabled = 0
+        batches_changed = 0
+        for batch_index, batch_input_dir in enumerate(batch_input_dirs, start=1):
+            result = self._prefilter_batch_run_mask_max_cmt(
+                batch_input_dir=batch_input_dir, max_cmt=max_cmt
+            )
+            total_disabled += result["disabled"]
+            if result["disabled"] > 0:
+                batches_changed += 1
+            print(
+                "  [max-cmt-filter] "
+                f"{batch_input_dir.parent.name} ({batch_index}/{len(batch_input_dirs)}): "
+                f"active {result['active_before']} -> {result['active_after']} "
+                f"(disabled {result['disabled']}, max_cmt={max_cmt})"
+            )
+        print(
+            "[max-cmt-filter] Done: "
+            f"disabled {total_disabled} active cells across {batches_changed} batches "
+            f"(veg_class > {max_cmt})."
+        )
+
     def execute(self) -> None:
         print("[wiemip_split] Starting integrated WIEMIP split workflow")
         if str(self.input_path).startswith("gcs://"):
@@ -422,7 +678,21 @@ class WiemipSplitCommand(BatchSplitCommand):
             raise ValueError("nbatches must be >= 1")
         print(f"[wiemip_split] Requested batch count: {nbatches}")
         runmask_prefilter = bool(getattr(self._args, "runmask_prefilter", True))
+        cmt0_filter = bool(getattr(self._args, "cmt0_filter", False))
+        no_max_cmt = bool(getattr(self._args, "no_max_cmt", False))
+        max_cmt_val = int(getattr(self._args, "max_cmt", 74))
+        max_cmt = None if no_max_cmt else max_cmt_val
         print(f"[wiemip_split] Run-mask prefilter: {runmask_prefilter}")
+        print(f"[wiemip_split] CMT0 run-mask filter (veg_class==0): {cmt0_filter}")
+        if max_cmt is not None:
+            print(
+                f"[wiemip_split] Max-CMT run-mask filter (veg_class > {max_cmt}): True"
+            )
+        else:
+            print(
+                "[wiemip_split] Max-CMT run-mask filter (veg_class > N): False "
+                "(--no-max-cmt)"
+            )
 
         print("[wiemip_split:1/8] Discovering run-mask source")
         _, _, run_mask_source = self._discover_inputs(input_path)
@@ -575,22 +845,52 @@ class WiemipSplitCommand(BatchSplitCommand):
                 expected_cols=bbox_cols,
             )
 
+        num_prefilters = (
+            int(runmask_prefilter)
+            + int(cmt0_filter)
+            + int(max_cmt is not None)
+        )
+        tail_total = 8 + num_prefilters
+        step = 8
+
         if runmask_prefilter:
             print(
-                "[wiemip_split:8/9] Pre-filtering split run-mask files "
+                f"[wiemip_split:{step}/{tail_total}] Pre-filtering split run-mask files "
                 "using required climate vars"
             )
             self._prefilter_split_run_masks(
                 batch_input_dirs=batch_input_dirs,
                 required_vars=REQUIRED_CLIMATE_VARS,
             )
-            setup_step = "[wiemip_split:9/9]"
+            step += 1
         else:
             print(
                 "[wiemip_split] Skipping run-mask prefilter due to "
                 "--no-runmask-prefilter."
             )
+
+        if cmt0_filter:
+            print(
+                f"[wiemip_split:{step}/{tail_total}] Pre-filtering split run-mask files "
+                "(disable cells where veg_class==0)"
+            )
+            self._prefilter_split_run_masks_cmt0(batch_input_dirs=batch_input_dirs)
+            step += 1
+
+        if max_cmt is not None:
+            print(
+                f"[wiemip_split:{step}/{tail_total}] Pre-filtering split run-mask files "
+                f"(disable cells where veg_class>{max_cmt})"
+            )
+            self._prefilter_split_run_masks_max_cmt(
+                batch_input_dirs=batch_input_dirs, max_cmt=max_cmt
+            )
+            step += 1
+
+        if num_prefilters == 0:
             setup_step = "[wiemip_split:8/8]"
+        else:
+            setup_step = f"[wiemip_split:{tail_total}/{tail_total}]"
 
         print(f"{setup_step} Creating runnable batch workdirs and configs")
         print("Setting up batch simulation folders")
