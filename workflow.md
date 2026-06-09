@@ -184,7 +184,7 @@ python ~/batch-processing/src/batch_processing/extra/wiemip_end_to_end.py \
 
 For a quick test, these small values are sufficient. For production runs, use the values recommended in the workflow documentation.
 
-### Restart from prior split (Option 2)
+### Restart from prior split
 
 Use this when you want a **new split directory** and **fresh run-masks** from a WIEMIP setup (with CMT filters), while **reusing restart NetCDFs** from a completed split.
 
