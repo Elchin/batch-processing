@@ -15,12 +15,31 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import xarray as xr
 
-DEFAULT_INPUT_PATH = (
-    "/mnt/exacloud/ejafarov_woodwellclimate_org/wiemip/setup_GFDL-ESM4"
-)
-DEFAULT_SPLIT_PATH = (
-    "/mnt/exacloud/ejafarov_woodwellclimate_org/wiemip/test_gfdl_split"
-)
+WIEMIP_SPLIT_METADATA_FILENAME = "wiemip_split_metadata.json"
+STAGING_INPUT_DIRNAME = "_wiemip_filtered_input"
+OPTION2_EPILOG = """
+Option 2 restart example (fresh setup masks + prior-split restart files):
+
+  python wiemip_end_to_end.py \\
+    --input /mnt/exacloud/$USER/wiemip/setup_stable \\
+    --split /mnt/exacloud/$USER/wiemip/stable_split_veg1_restart \\
+    --restart_from /mnt/exacloud/$USER/wiemip/stable_split_veg1 \\
+    --restart_file restart-sp.nc \\
+    --max-cmt 1 --cmt0-filter \\
+    -sp dask -p 0 -e 0 -s 0 -t 20
+
+Run-masks are built from --input via wiemip_split. --restart_from copies restart
+NetCDFs only (not run-mask.nc or config.js from the source split).
+"""
+
+
+def _default_exacloud_wiemip_path(subpath: str) -> str:
+    user = os.environ.get("USER", "YOURUSER")
+    return f"/mnt/exacloud/{user}_woodwellclimate_org/wiemip/{subpath}"
+
+
+DEFAULT_INPUT_PATH = _default_exacloud_wiemip_path("setup_GFDL-ESM4")
+DEFAULT_SPLIT_PATH = _default_exacloud_wiemip_path("test_gfdl_split")
 DEFAULT_PLOT_SCRIPT = os.path.expanduser(
     "~/Circumpolar_TEM_aux_scripts/plot_nc_all_files.py"
 )
@@ -239,6 +258,88 @@ def format_incomplete_progress(
     return ", ".join(chunks)
 
 
+def _is_staging_input_path(path: Path) -> bool:
+    """True if path looks like a prior split staging dir, not a fresh WIEMIP setup."""
+    if path.name == STAGING_INPUT_DIRNAME:
+        return True
+    parent = path.parent
+    metadata_file = parent / WIEMIP_SPLIT_METADATA_FILENAME
+    if metadata_file.is_file() and get_batch_dirs(parent):
+        return True
+    return False
+
+
+def _print_option2_restart_banner(
+    input_path: Path,
+    split_path: Path,
+    restart_from_path: Path,
+    restart_file: str,
+    *,
+    runmask_prefilter: bool,
+    cmt0_filter: bool,
+    no_max_cmt: bool,
+    max_cmt: int,
+) -> None:
+    print("[INFO] Option 2 restart workflow:")
+    print(f"  Run-masks + inputs: wiemip_split from --input ({input_path})")
+    print(f"  Restart files only: --restart_from ({restart_from_path})")
+    print(f"  New split output:   {split_path}")
+    print(f"  Restart filename:   {restart_file}")
+    print(
+        "  CMT / climate prefilters during split: "
+        f"runmask_prefilter={runmask_prefilter}, "
+        f"cmt0_filter={cmt0_filter}, "
+        f"max_cmt={'disabled' if no_max_cmt else max_cmt}"
+    )
+
+
+def _validate_option2_restart(
+    input_path: Path,
+    restart_from_path: Path,
+    nbatches: int,
+    restart_file: str,
+) -> None:
+    """Validate restart_from layout matches Option 2 expectations (fail-hard on batch count)."""
+    source_batch_dirs = get_batch_dirs(restart_from_path)
+    if not source_batch_dirs:
+        raise FileNotFoundError(f"No batch_x dirs found under {restart_from_path}")
+
+    source_count = len(source_batch_dirs)
+    if source_count != nbatches:
+        raise ValueError(
+            f"--restart_from has {source_count} batch directories but --input run-mask "
+            f"implies nbatches={nbatches}. Use the same setup and batch geometry for both, "
+            f"or pick a matching source split."
+        )
+
+    if _is_staging_input_path(input_path):
+        print(
+            "[WARN] --input looks like a prior split staging directory "
+            f"({input_path}). For Option 2, use a full WIEMIP setup directory "
+            "(e.g. setup_stable with top-level run-mask.nc and vegetation.nc), "
+            f"not {STAGING_INPUT_DIRNAME}."
+        )
+
+    missing_restart_batches: List[int] = []
+    for src_batch_dir in source_batch_dirs:
+        batch_id = batch_id_from_path(src_batch_dir)
+        src_restart = src_batch_dir / "output" / restart_file
+        if not src_restart.exists():
+            missing_restart_batches.append(batch_id)
+
+    if missing_restart_batches:
+        preview = ", ".join(f"batch_{i}" for i in missing_restart_batches[:10])
+        suffix = (
+            f" (+{len(missing_restart_batches) - 10} more)"
+            if len(missing_restart_batches) > 10
+            else ""
+        )
+        print(
+            f"[WARN] {len(missing_restart_batches)} source batch(es) missing "
+            f"output/{restart_file}: {preview}{suffix}"
+        )
+
+
 def run_rerun_pass(
     split_path: Path,
     batch_ids: Sequence[int],
@@ -294,14 +395,20 @@ def run_rerun_pass(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="WIEMIP end-to-end automation (split -> run -> rerun passes -> merge -> plot)."
+        description="WIEMIP end-to-end automation (split -> run -> rerun passes -> merge -> plot).",
+        epilog=OPTION2_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--input",
         "--input-path",
         dest="input_path",
         default=DEFAULT_INPUT_PATH,
-        help=f"WIEMIP input setup directory (default: {DEFAULT_INPUT_PATH})",
+        help=(
+            "WIEMIP setup directory with top-level run-mask.nc and vegetation.nc "
+            f"(default: {DEFAULT_INPUT_PATH}). Do not use a prior split's "
+            f"{STAGING_INPUT_DIRNAME} folder."
+        ),
     )
     parser.add_argument(
         "--split",
@@ -412,11 +519,10 @@ def main() -> None:
         dest="restart_from",
         default=None,
         help=(
-            "Base path of the source split run to copy restart files from. "
-            "For each batch_x found there, <restart_file> will be copied from "
-            "batch_x/output/ into the corresponding new batch_x/output/ and "
-            "config.js will be updated to point at it. "
-            "Example: mnt/exacloud/cchang_woodwellclimate_org/wiemip/stable_split_veg1"
+            "Prior split root with batch_x/ directories (Option 2 restart). Copies "
+            "<restart_file> from each batch_x/output/ into the new split and sets "
+            "IO.restart_from in config.js. Does not copy run-mask.nc or config.js "
+            "from the source split; masks come from --input via wiemip_split."
         ),
     )
     parser.add_argument(
@@ -443,6 +549,7 @@ def main() -> None:
         raise FileNotFoundError(f"Input run-mask missing: {input_path / 'run-mask.nc'}")
     if args.poll_seconds < 1:
         raise ValueError("--poll-seconds must be >= 1")
+    restart_from_path: Path | None = None
     if args.restart_from:
         restart_from_path = normalize_path(args.restart_from)
         if not restart_from_path.exists():
@@ -455,6 +562,24 @@ def main() -> None:
     nbatches = determine_nbatches(input_path)
     max_batch_id = nbatches - 1
     print(f"[STEP 0] Computed nbatches={nbatches} (max batch id: {max_batch_id})")
+
+    if restart_from_path is not None:
+        _validate_option2_restart(
+            input_path=input_path,
+            restart_from_path=restart_from_path,
+            nbatches=nbatches,
+            restart_file=args.restart_file,
+        )
+        _print_option2_restart_banner(
+            input_path=input_path,
+            split_path=split_path,
+            restart_from_path=restart_from_path,
+            restart_file=args.restart_file,
+            runmask_prefilter=args.runmask_prefilter,
+            cmt0_filter=args.cmt0_filter,
+            no_max_cmt=args.no_max_cmt,
+            max_cmt=args.max_cmt,
+        )
 
     # Step 1: WIEMIP split.
     split_cmd = [
@@ -491,21 +616,26 @@ def main() -> None:
     run_cmd(split_cmd, dry_run=args.dry_run)
 
     # Step 1.5: Seed restart files from source split run into new batch output dirs.
-    if args.restart_from:
-        restart_from_path = normalize_path(args.restart_from)
+    if restart_from_path is not None:
         source_batch_dirs = get_batch_dirs(restart_from_path)
-        if not source_batch_dirs:
-            raise FileNotFoundError(f"No batch_x dirs found under {restart_from_path}")
+        print(
+            f"[STEP 1.5] Restart-only: masks from split; IO.restart_from -> "
+            f"{split_path}/batch_N/output/{args.restart_file}"
+        )
         print(
             f"[STEP 1.5] Seeding '{args.restart_file}' from {restart_from_path} "
             f"({len(source_batch_dirs)} batches)"
         )
+        seeded_count = 0
+        missing_restart_count = 0
         for src_batch_dir in source_batch_dirs:
             batch_id = batch_id_from_path(src_batch_dir)
             src_restart = src_batch_dir / "output" / args.restart_file
             if not src_restart.exists():
+                missing_restart_count += 1
                 print(f"[WARN] Missing {args.restart_file} for batch_{batch_id}: {src_restart}")
                 continue
+            seeded_count += 1
             dst_batch_dir = split_path / f"batch_{batch_id}"
             dst_output_dir = dst_batch_dir / "output"
             dst_output_dir.mkdir(parents=True, exist_ok=True)
@@ -523,6 +653,11 @@ def main() -> None:
                 with open(config_file, "w") as fh:
                     json.dump(config_data, fh, indent=4)
             print(f"[RESTART] batch_{batch_id}: {src_restart} -> {dst_restart}")
+
+        print(
+            f"[STEP 1.5] Restart seed summary: {seeded_count} copied, "
+            f"{missing_restart_count} missing source {args.restart_file}"
+        )
 
     # Step 2: Submit all batches.
     run_cmd(["bp", "batch", "run", "-b", split_path.as_posix()], dry_run=args.dry_run)

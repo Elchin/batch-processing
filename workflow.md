@@ -184,6 +184,56 @@ python ~/batch-processing/src/batch_processing/extra/wiemip_end_to_end.py \
 
 For a quick test, these small values are sufficient. For production runs, use the values recommended in the workflow documentation.
 
+### Restart from prior split (Option 2)
+
+Use this when you want a **new split directory** and **fresh run-masks** from a WIEMIP setup (with CMT filters), while **reusing restart NetCDFs** from a completed split.
+
+**Requirements**
+
+- `--input` must be a full WIEMIP setup directory (top-level `run-mask.nc`, `vegetation.nc`, climate files). Do not use a prior split’s `_wiemip_filtered_input` folder.
+- `--restart_from` must be the root of a prior split (contains `batch_0`, `batch_1`, …).
+- Batch count in `--restart_from` must match the active-row count implied by `--input` `run-mask.nc` (the script fails if they differ).
+
+**What comes from where**
+
+| Artifact | Source |
+|----------|--------|
+| `batch_N/input/run-mask.nc`, vegetation, climate | `wiemip_split` from `--input` (+ `--max-cmt`, `--cmt0-filter`, climate prefilter) |
+| `batch_N/output/restart-sp.nc` (or `--restart_file`) | Copied from `--restart_from/batch_N/output/` |
+| `config.js` (except `IO.restart_from`) | New batch workdir from dvm-dos-tem + `update_config` |
+| `IO.restart_from` in `config.js` | Patched to new `batch_N/output/<restart_file>` path |
+
+**Example**
+
+```bash
+python ~/batch-processing/src/batch_processing/extra/wiemip_end_to_end.py \
+  --input /mnt/exacloud/$USER/wiemip/setup_stable \
+  --split /mnt/exacloud/$USER/wiemip/stable_split_veg1_restart \
+  --restart_from /mnt/exacloud/$USER/wiemip/stable_split_veg1 \
+  --restart_file restart-sp.nc \
+  --max-cmt 1 \
+  --cmt0-filter \
+  -sp dask \
+  -p 0 -e 0 -s 0 -t 20
+```
+
+**Anti-patterns**
+
+- `--input .../stable_split_veg1/_wiemip_filtered_input` — reuses old staging masks; CMT flags may appear to do nothing.
+- `--restart_from` set but omitting `--max-cmt` when you expect strict CMT — default is `--max-cmt 74`, which disables few cells.
+- Expecting `run-mask.nc` to be copied from the source split — Option 2 does not do that; only restart files are copied.
+
+Dry-run validation (paths and batch-count check, no Slurm):
+
+```bash
+python ~/batch-processing/src/batch_processing/extra/wiemip_end_to_end.py \
+  --dry-run \
+  --input /mnt/exacloud/$USER/wiemip/setup_stable \
+  --split /mnt/exacloud/$USER/wiemip/stable_split_veg1_restart \
+  --restart_from /mnt/exacloud/$USER/wiemip/stable_split_veg1 \
+  --max-cmt 1 --cmt0-filter
+```
+
 ---
 
 ## 4. Recommended workflow order

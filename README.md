@@ -144,6 +144,21 @@ bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_
 bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 --no-max-cmt
 ```
 
+### wiemip_end_to_end.py (Option 2 restart workflow)
+
+Script: `src/batch_processing/extra/wiemip_end_to_end.py` — runs `wiemip_split`, optional restart seeding, `bp batch run`, rerun passes, `wiemip_merge`, and plotting.
+
+For **restarting a transient from a prior split** while rebuilding run-masks from a fresh setup, see [workflow.md — Restart from prior split (Option 2)](workflow.md#restart-from-prior-split-option-2).
+
+CMT flags (forwarded to `wiemip_split`):
+
+* `--max-cmt N` — disable cells where `veg_class > N` (default `74`).
+* `--no-max-cmt` — disable that prefilter.
+* `--cmt0-filter` — disable cells where `veg_class == 0`.
+* `--no-runmask-prefilter` — skip climate invalid-cell prefilter.
+
+`--restart_from` copies only restart NetCDFs from `batch_x/output/`; it does not copy `run-mask.nc` from the source split.
+
 ### bp batch wiemip_merge
 
 Merges WIEMIP batch outputs produced by `bp batch wiemip_split` in two stages.
