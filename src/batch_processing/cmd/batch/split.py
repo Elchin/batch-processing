@@ -4,11 +4,12 @@ import re
 import shutil
 import subprocess
 import dask.distributed
+import numpy as np
 import xarray as xr
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool
 from pathlib import Path
-from typing import List
+from typing import Iterable, List, Optional, Tuple
 
 from batch_processing.cmd.base import BaseCommand
 from batch_processing.utils.utils import (
@@ -47,6 +48,75 @@ INPUT_FILES_TO_SPLIT = [
 ]
 BATCH_DIRS: List[Path] = []
 BATCH_INPUT_DIRS: List[Path] = []
+
+RUN_MASK_DESTINATION = "run-mask.nc"
+VEGETATION_DESTINATION = "vegetation.nc"
+VEG_CLASS_VARIABLE = "veg_class"
+RUN_MASK_VARIABLE = "run"
+RUN_ENABLED_VALUE = 1
+OUTPUT_NETCDF_FORMAT = "NETCDF4_CLASSIC"
+ROW_DIM_CANDIDATES = ("Y", "y", "latitude", "lat")
+COL_DIM_CANDIDATES = ("X", "x", "longitude", "lon")
+
+
+def _open_dataset_for_read(path: Path, decode_cf: bool = False) -> xr.Dataset:
+    path_str = path.as_posix()
+    try:
+        return xr.open_dataset(
+            path_str,
+            engine="h5netcdf",
+            decode_times=False,
+            decode_cf=decode_cf,
+        )
+    except Exception:
+        return xr.open_dataset(
+            path_str,
+            engine="netcdf4",
+            decode_times=False,
+            decode_cf=decode_cf,
+        )
+
+
+def _detect_spatial_dims(dim_names: Iterable[str]) -> Optional[Tuple[str, str]]:
+    dim_name_set = set(dim_names)
+    for row_dim in ROW_DIM_CANDIDATES:
+        if row_dim not in dim_name_set:
+            continue
+        for col_dim in COL_DIM_CANDIDATES:
+            if col_dim in dim_name_set:
+                return row_dim, col_dim
+    return None
+
+
+def _extract_run_mask_2d(
+    ds: xr.Dataset,
+    source_label: str,
+    run_var: str = RUN_MASK_VARIABLE,
+) -> tuple[xr.DataArray, str, str]:
+    if run_var not in ds:
+        raise KeyError(f"{source_label} must contain '{run_var}' variable.")
+
+    run_da = ds[run_var]
+    spatial_dims = _detect_spatial_dims(run_da.dims)
+    if spatial_dims is None:
+        raise ValueError(
+            f"{source_label}:{run_var} must include row/col dims from "
+            f"{ROW_DIM_CANDIDATES} x {COL_DIM_CANDIDATES}. Found {tuple(run_da.dims)}."
+        )
+    row_dim, col_dim = spatial_dims
+
+    for dim_name in run_da.dims:
+        if dim_name in (row_dim, col_dim):
+            continue
+        if int(run_da.sizes[dim_name]) != 1:
+            raise ValueError(
+                f"{source_label}:{run_var} contains non-singleton extra dimension "
+                f"'{dim_name}' with size {int(run_da.sizes[dim_name])}."
+            )
+        run_da = run_da.isel({dim_name: 0}, drop=True)
+
+    run_da = run_da.transpose(row_dim, col_dim)
+    return run_da, row_dim, col_dim
 
 
 class BatchSplitCommand(BaseCommand):
@@ -227,7 +297,276 @@ class BatchSplitCommand(BaseCommand):
 
         cluster.close()
 
+    def _compute_veg_class_zero_mask(
+        self, da: xr.DataArray, row_dim: str, col_dim: str, var_name: str
+    ) -> xr.DataArray:
+        if row_dim not in da.dims or col_dim not in da.dims:
+            raise ValueError(
+                f"Vegetation variable '{var_name}' must include '{row_dim}' and "
+                f"'{col_dim}' dims. Found {tuple(da.dims)}."
+            )
+
+        da_work = da
+        for dim_name in list(da_work.dims):
+            if dim_name in (row_dim, col_dim):
+                continue
+            sz = int(da_work.sizes[dim_name])
+            if sz == 1:
+                da_work = da_work.isel({dim_name: 0}, drop=True)
+            elif sz < 1:
+                raise ValueError(
+                    f"{var_name}: dimension '{dim_name}' has invalid size {sz}."
+                )
+
+        zero = da_work == 0
+        reduce_dims = [d for d in zero.dims if d not in (row_dim, col_dim)]
+        if reduce_dims:
+            zero = zero.any(dim=reduce_dims)
+        return zero.transpose(row_dim, col_dim)
+
+    def _compute_veg_class_gt_mask(
+        self,
+        da: xr.DataArray,
+        row_dim: str,
+        col_dim: str,
+        var_name: str,
+        max_cmt: int,
+    ) -> xr.DataArray:
+        if row_dim not in da.dims or col_dim not in da.dims:
+            raise ValueError(
+                f"Vegetation variable '{var_name}' must include '{row_dim}' and "
+                f"'{col_dim}' dims. Found {tuple(da.dims)}."
+            )
+
+        da_work = da
+        for dim_name in list(da_work.dims):
+            if dim_name in (row_dim, col_dim):
+                continue
+            sz = int(da_work.sizes[dim_name])
+            if sz == 1:
+                da_work = da_work.isel({dim_name: 0}, drop=True)
+            elif sz < 1:
+                raise ValueError(
+                    f"{var_name}: dimension '{dim_name}' has invalid size {sz}."
+                )
+
+        high = da_work > max_cmt
+        reduce_dims = [d for d in high.dims if d not in (row_dim, col_dim)]
+        if reduce_dims:
+            high = high.any(dim=reduce_dims)
+        return high.transpose(row_dim, col_dim)
+
+    def _write_filtered_run_mask(
+        self,
+        run_mask_file: Path,
+        run_mask_ds: xr.Dataset,
+        run_mask_da: xr.DataArray,
+        active_before: xr.DataArray,
+        disable_mask: xr.DataArray,
+    ) -> None:
+        updated_values = np.where(
+            active_before.values & ~disable_mask.values, RUN_ENABLED_VALUE, 0
+        ).astype(run_mask_da.dtype, copy=False)
+        run_mask_out = run_mask_ds.copy(deep=True)
+        run_mask_out[RUN_MASK_VARIABLE] = xr.DataArray(
+            updated_values,
+            dims=run_mask_da.dims,
+            coords=run_mask_da.coords,
+            attrs=run_mask_da.attrs.copy(),
+        )
+        tmp_path = run_mask_file.with_suffix(".tmp.nc")
+        run_mask_out.to_netcdf(
+            tmp_path.as_posix(),
+            engine="netcdf4",
+            format=OUTPUT_NETCDF_FORMAT,
+        )
+        run_mask_out.close()
+        tmp_path.replace(run_mask_file)
+
+    def _prefilter_batch_run_mask_cmt0(self, batch_input_dir: Path) -> dict[str, int]:
+        run_mask_file = batch_input_dir / RUN_MASK_DESTINATION
+        vegetation_file = batch_input_dir / VEGETATION_DESTINATION
+        if not run_mask_file.exists():
+            raise FileNotFoundError(f"Missing run-mask for cmt0-filter: {run_mask_file}")
+        if not vegetation_file.exists():
+            raise FileNotFoundError(
+                f"Missing vegetation for cmt0-filter: {vegetation_file}"
+            )
+
+        with _open_dataset_for_read(run_mask_file) as run_mask_ds:
+            run_mask_da, row_dim, col_dim = _extract_run_mask_2d(
+                run_mask_ds, run_mask_file.name, run_var=RUN_MASK_VARIABLE
+            )
+            active_before = np.isfinite(run_mask_da) & np.isclose(
+                run_mask_da, RUN_ENABLED_VALUE
+            )
+            active_before_count = int(active_before.sum().item())
+
+            with _open_dataset_for_read(vegetation_file) as veg_ds:
+                if VEG_CLASS_VARIABLE not in veg_ds:
+                    raise KeyError(
+                        f"{vegetation_file} missing '{VEG_CLASS_VARIABLE}' variable."
+                    )
+                veg_zero = self._compute_veg_class_zero_mask(
+                    veg_ds[VEG_CLASS_VARIABLE],
+                    row_dim=row_dim,
+                    col_dim=col_dim,
+                    var_name=VEG_CLASS_VARIABLE,
+                )
+
+            if veg_zero.sizes != run_mask_da.sizes:
+                raise ValueError(
+                    f"veg_class grid {dict(veg_zero.sizes)} does not match "
+                    f"run grid {dict(run_mask_da.sizes)} in {batch_input_dir}."
+                )
+
+            disable_mask = active_before & veg_zero
+            disabled_count = int(disable_mask.sum().item())
+            active_after_count = active_before_count - disabled_count
+
+            if disabled_count == 0:
+                return {
+                    "active_before": active_before_count,
+                    "active_after": active_after_count,
+                    "disabled": disabled_count,
+                }
+
+            self._write_filtered_run_mask(
+                run_mask_file, run_mask_ds, run_mask_da, active_before, disable_mask
+            )
+
+        return {
+            "active_before": active_before_count,
+            "active_after": active_after_count,
+            "disabled": disabled_count,
+        }
+
+    def _prefilter_split_run_masks_cmt0(self, batch_input_dirs: List[Path]) -> None:
+        total_disabled = 0
+        batches_changed = 0
+        for batch_index, batch_input_dir in enumerate(batch_input_dirs, start=1):
+            result = self._prefilter_batch_run_mask_cmt0(batch_input_dir=batch_input_dir)
+            total_disabled += result["disabled"]
+            if result["disabled"] > 0:
+                batches_changed += 1
+            print(
+                "  [cmt0-filter] "
+                f"{batch_input_dir.parent.name} ({batch_index}/{len(batch_input_dirs)}): "
+                f"active {result['active_before']} -> {result['active_after']} "
+                f"(disabled {result['disabled']})"
+            )
+        print(
+            "[cmt0-filter] Done: "
+            f"disabled {total_disabled} active cells across {batches_changed} batches."
+        )
+
+    def _prefilter_batch_run_mask_max_cmt(
+        self, batch_input_dir: Path, max_cmt: int
+    ) -> dict[str, int]:
+        run_mask_file = batch_input_dir / RUN_MASK_DESTINATION
+        vegetation_file = batch_input_dir / VEGETATION_DESTINATION
+        if not run_mask_file.exists():
+            raise FileNotFoundError(
+                f"Missing run-mask for max-cmt filter: {run_mask_file}"
+            )
+        if not vegetation_file.exists():
+            raise FileNotFoundError(
+                f"Missing vegetation for max-cmt filter: {vegetation_file}"
+            )
+
+        with _open_dataset_for_read(run_mask_file) as run_mask_ds:
+            run_mask_da, row_dim, col_dim = _extract_run_mask_2d(
+                run_mask_ds, run_mask_file.name, run_var=RUN_MASK_VARIABLE
+            )
+            active_before = np.isfinite(run_mask_da) & np.isclose(
+                run_mask_da, RUN_ENABLED_VALUE
+            )
+            active_before_count = int(active_before.sum().item())
+
+            with _open_dataset_for_read(vegetation_file) as veg_ds:
+                if VEG_CLASS_VARIABLE not in veg_ds:
+                    raise KeyError(
+                        f"{vegetation_file} missing '{VEG_CLASS_VARIABLE}' variable."
+                    )
+                veg_high = self._compute_veg_class_gt_mask(
+                    veg_ds[VEG_CLASS_VARIABLE],
+                    row_dim=row_dim,
+                    col_dim=col_dim,
+                    var_name=VEG_CLASS_VARIABLE,
+                    max_cmt=max_cmt,
+                )
+
+            if veg_high.sizes != run_mask_da.sizes:
+                raise ValueError(
+                    f"veg_class grid {dict(veg_high.sizes)} does not match "
+                    f"run grid {dict(run_mask_da.sizes)} in {batch_input_dir}."
+                )
+
+            disable_mask = active_before & veg_high
+            disabled_count = int(disable_mask.sum().item())
+            active_after_count = active_before_count - disabled_count
+
+            if disabled_count == 0:
+                return {
+                    "active_before": active_before_count,
+                    "active_after": active_after_count,
+                    "disabled": disabled_count,
+                }
+
+            self._write_filtered_run_mask(
+                run_mask_file, run_mask_ds, run_mask_da, active_before, disable_mask
+            )
+
+        return {
+            "active_before": active_before_count,
+            "active_after": active_after_count,
+            "disabled": disabled_count,
+        }
+
+    def _prefilter_split_run_masks_max_cmt(
+        self, batch_input_dirs: List[Path], max_cmt: int
+    ) -> None:
+        total_disabled = 0
+        batches_changed = 0
+        for batch_index, batch_input_dir in enumerate(batch_input_dirs, start=1):
+            result = self._prefilter_batch_run_mask_max_cmt(
+                batch_input_dir=batch_input_dir, max_cmt=max_cmt
+            )
+            total_disabled += result["disabled"]
+            if result["disabled"] > 0:
+                batches_changed += 1
+            print(
+                "  [max-cmt-filter] "
+                f"{batch_input_dir.parent.name} ({batch_index}/{len(batch_input_dirs)}): "
+                f"active {result['active_before']} -> {result['active_after']} "
+                f"(disabled {result['disabled']}, max_cmt={max_cmt})"
+            )
+        print(
+            "[max-cmt-filter] Done: "
+            f"disabled {total_disabled} active cells across {batches_changed} batches "
+            f"(veg_class > {max_cmt})."
+        )
+
     def execute(self):
+        global BATCH_DIRS, BATCH_INPUT_DIRS
+        BATCH_DIRS = []
+        BATCH_INPUT_DIRS = []
+
+        cmt0_filter = bool(getattr(self._args, "cmt0_filter", False))
+        no_max_cmt = bool(getattr(self._args, "no_max_cmt", False))
+        max_cmt_val = int(getattr(self._args, "max_cmt", 74))
+        max_cmt = None if no_max_cmt else max_cmt_val
+        print(f"[batch split] CMT0 run-mask filter (veg_class==0): {cmt0_filter}")
+        if max_cmt is not None:
+            print(
+                f"[batch split] Max-CMT run-mask filter (veg_class > {max_cmt}): True"
+            )
+        else:
+            print(
+                "[batch split] Max-CMT run-mask filter (veg_class > N): False "
+                "(--no-max-cmt)"
+            )
+
         reading_remote_data = False
         if self.input_path.startswith("gcs://"):
             self.input_path = self.input_path.replace("gcs://", "")
@@ -337,6 +676,16 @@ class BatchSplitCommand(BaseCommand):
             self._split_with_dask(self.input_path)
         else:
             self._split_with_nco(0, DIMENSION_SIZE, self.input_path, SPLIT_DIMENSION)
+
+        if cmt0_filter:
+            print("Pre-filtering split run-mask files (disable cells where veg_class==0)")
+            self._prefilter_split_run_masks_cmt0(BATCH_INPUT_DIRS)
+        if max_cmt is not None:
+            print(
+                f"Pre-filtering split run-mask files "
+                f"(disable cells where veg_class>{max_cmt})"
+            )
+            self._prefilter_split_run_masks_max_cmt(BATCH_INPUT_DIRS, max_cmt)
 
         print("Set up the batch simulation")
         for batch_dir, batch_input_dir in zip(BATCH_DIRS, BATCH_INPUT_DIRS):
