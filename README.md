@@ -144,7 +144,7 @@ bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_
 bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 --no-max-cmt
 ```
 
-### wiemip_end_to_end.py (Option 2 restart workflow)
+### wiemip_end_to_end.py
 
 Script: `src/batch_processing/extra/wiemip_end_to_end.py` — runs `wiemip_split`, optional restart seeding, `bp batch run`, rerun passes, `wiemip_merge`, and plotting.
 
