@@ -330,12 +330,12 @@ def batch_split(
             "provided (example: --restart_from \"\")."
         ),
     ),
-    mpi_ranks: int = typer.Option(
-        1,
+    mpi_ranks: Optional[int] = typer.Option(
+        None,
         "--mpi-ranks",
         help=(
-            "Number of MPI ranks per batch job. "
-            "Default is 1 to avoid Lustre NetCDF restart write failures."
+            "Explicit MPI rank count per batch job (mpirun -n N). "
+            "If omitted, slurm_runner uses mpirun --use-hwthread-cpus."
         ),
     ),
 ):
@@ -432,12 +432,12 @@ def batch_wiemip_split(
             "provided (example: --restart_from \"\")."
         ),
     ),
-    mpi_ranks: int = typer.Option(
-        1,
+    mpi_ranks: Optional[int] = typer.Option(
+        None,
         "--mpi-ranks",
         help=(
-            "Number of MPI ranks per batch job. "
-            "Default is 1 to avoid Lustre NetCDF restart write failures."
+            "Explicit MPI rank count per batch job (mpirun -n N). "
+            "If omitted, slurm_runner uses mpirun --use-hwthread-cpus."
         ),
     ),
     runmask_prefilter: bool = typer.Option(

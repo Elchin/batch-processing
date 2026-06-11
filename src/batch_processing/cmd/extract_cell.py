@@ -14,6 +14,7 @@ from batch_processing.utils.utils import (
     generate_random_string,
     get_project_root,
     interpret_path,
+    mpirun_rank_flags,
 )
 
 
@@ -87,7 +88,7 @@ class ExtractCellCommand(BaseCommand):
                 "n": self._args.n,
                 "additional_flags": "",
                 "flags_before_max_output": "",
-                "mpi_ranks": 1,
+                "mpirun_rank_flags": mpirun_rank_flags(None),
             }
         )
 

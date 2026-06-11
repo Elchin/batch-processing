@@ -155,12 +155,20 @@ def count_active_cells(run_mask_path: Path) -> int:
     return int(np.sum(active))
 
 
+def run_status_is_valid(run_status_path: Path) -> bool:
+    """True when run_status.nc exists and is non-empty (valid NetCDF header)."""
+    return run_status_path.is_file() and run_status_path.stat().st_size > 0
+
+
 def count_completed_cells(run_status_path: Path) -> int:
-    with xr.open_dataset(run_status_path, decode_times=False) as ds:
-        if RUN_STATUS_VAR not in ds:
-            raise KeyError(f"{run_status_path} missing '{RUN_STATUS_VAR}'")
-        status_da = to_2d_spatial_array(ds[RUN_STATUS_VAR], run_status_path.as_posix())
-        status_values = np.asarray(status_da.values)
+    try:
+        with xr.open_dataset(run_status_path, decode_times=False) as ds:
+            if RUN_STATUS_VAR not in ds:
+                raise KeyError(f"{run_status_path} missing '{RUN_STATUS_VAR}'")
+            status_da = to_2d_spatial_array(ds[RUN_STATUS_VAR], run_status_path.as_posix())
+            status_values = np.asarray(status_da.values)
+    except (OSError, ValueError, KeyError) as exc:
+        raise ValueError(f"Unreadable run_status file: {run_status_path} ({exc})") from exc
     completed = np.isfinite(status_values) & np.isclose(status_values, RUN_SUCCESS_VALUE)
     return int(np.sum(completed))
 
@@ -180,13 +188,25 @@ def collect_incomplete_batches(split_path: Path) -> Tuple[List[int], Dict[int, T
             continue
 
         n_cells = count_active_cells(run_mask_path)
-        if not run_status_path.exists():
-            print(f"[WARN] Missing run_status for batch_{batch_id}: {run_status_path}")
+        if not run_status_is_valid(run_status_path):
+            if run_status_path.exists():
+                print(
+                    f"[WARN] Invalid run_status for batch_{batch_id} "
+                    f"(missing or empty): {run_status_path}"
+                )
+            else:
+                print(f"[WARN] Missing run_status for batch_{batch_id}: {run_status_path}")
             progress[batch_id] = (0, n_cells)
             incomplete.append(batch_id)
             continue
 
-        m_cells = count_completed_cells(run_status_path)
+        try:
+            m_cells = count_completed_cells(run_status_path)
+        except ValueError as exc:
+            print(f"[WARN] {exc}")
+            progress[batch_id] = (0, n_cells)
+            incomplete.append(batch_id)
+            continue
         progress[batch_id] = (m_cells, n_cells)
         if m_cells < n_cells:
             incomplete.append(batch_id)
@@ -199,6 +219,8 @@ def wait_for_jobs(
     poll_seconds: int,
     retry_jobs: bool = False,
     dry_run: bool = False,
+    initial_grace_seconds: int = 120,
+    stable_empty_polls: int = 2,
 ) -> None:
     if not batch_ids:
         print("[WAIT] No batch ids provided, skipping queue wait.")
@@ -221,6 +243,10 @@ def wait_for_jobs(
     if not user:
         raise EnvironmentError("USER environment variable is not set.")
 
+    start_time = time.time()
+    empty_poll_streak = 0
+    saw_active_jobs = False
+
     while True:
         result = subprocess.run(
             ["squeue", "-h", "-u", user, "-o", "%A|%j|%T"],
@@ -237,12 +263,39 @@ def wait_for_jobs(
             if job_name in expected_names:
                 active_names.add(job_name)
 
-        if not active_names:
-            print("[WAIT] No matching jobs in queue. Continuing.")
+        if active_names:
+            saw_active_jobs = True
+            empty_poll_streak = 0
+            print(
+                f"[WAIT] {len(active_names)} matching jobs still running/pending. "
+                f"Next check in {poll_seconds} seconds."
+            )
+            time.sleep(poll_seconds)
+            continue
+
+        elapsed = time.time() - start_time
+        if not saw_active_jobs and elapsed < initial_grace_seconds:
+            print(
+                f"[WAIT] No matching jobs in queue yet "
+                f"({elapsed:.0f}s / {initial_grace_seconds}s grace). "
+                f"Next check in {poll_seconds} seconds."
+            )
+            time.sleep(poll_seconds)
+            continue
+
+        empty_poll_streak += 1
+        if empty_poll_streak >= stable_empty_polls:
+            if saw_active_jobs:
+                print("[WAIT] Queue clear after observing active jobs. Continuing.")
+            else:
+                print(
+                    "[WARN] No matching jobs were observed in queue during grace period. "
+                    "Jobs may have failed immediately or were never submitted. Continuing."
+                )
             return
 
         print(
-            f"[WAIT] {len(active_names)} matching jobs still running/pending. "
+            f"[WAIT] Queue empty (check {empty_poll_streak}/{stable_empty_polls}). "
             f"Next check in {poll_seconds} seconds."
         )
         time.sleep(poll_seconds)
@@ -346,6 +399,7 @@ def run_rerun_pass(
     pass_index: int,
     poll_seconds: int,
     dry_run: bool,
+    initial_grace_seconds: int = 120,
 ) -> None:
     if not batch_ids:
         print(f"[PASS {pass_index}] No incomplete batches. Skipping rerun pass.")
@@ -356,8 +410,11 @@ def run_rerun_pass(
     for batch_id in batch_ids:
         batch_path = split_path / f"batch_{batch_id}"
         run_status_path = batch_path / "output" / "run_status.nc"
-        if run_status_path.exists():
-            before_counts[batch_id] = count_completed_cells(run_status_path)
+        if run_status_is_valid(run_status_path):
+            try:
+                before_counts[batch_id] = count_completed_cells(run_status_path)
+            except ValueError:
+                before_counts[batch_id] = 0
         else:
             before_counts[batch_id] = 0
         run_cmd(["bp", "batch", "wiemip_re-run", batch_path.as_posix()], dry_run=dry_run)
@@ -368,6 +425,7 @@ def run_rerun_pass(
         retry_jobs=True,
         poll_seconds=poll_seconds,
         dry_run=dry_run,
+        initial_grace_seconds=initial_grace_seconds,
     )
 
     for batch_id in batch_ids:
@@ -422,6 +480,15 @@ def main() -> None:
         type=int,
         default=300,
         help="Queue polling interval in seconds (default: 300).",
+    )
+    parser.add_argument(
+        "--initial-grace-seconds",
+        type=int,
+        default=120,
+        help=(
+            "Seconds to keep polling before treating an empty queue as finished "
+            "when no matching jobs were seen yet (default: 120)."
+        ),
     )
     parser.add_argument(
         "--plot-script",
@@ -549,6 +616,8 @@ def main() -> None:
         raise FileNotFoundError(f"Input run-mask missing: {input_path / 'run-mask.nc'}")
     if args.poll_seconds < 1:
         raise ValueError("--poll-seconds must be >= 1")
+    if args.initial_grace_seconds < 0:
+        raise ValueError("--initial-grace-seconds must be >= 0")
     restart_from_path: Path | None = None
     if args.restart_from:
         restart_from_path = normalize_path(args.restart_from)
@@ -670,6 +739,7 @@ def main() -> None:
         retry_jobs=False,
         poll_seconds=args.poll_seconds,
         dry_run=args.dry_run,
+        initial_grace_seconds=args.initial_grace_seconds,
     )
 
     if args.dry_run:
@@ -693,6 +763,7 @@ def main() -> None:
         pass_index=1,
         poll_seconds=args.poll_seconds,
         dry_run=args.dry_run,
+        initial_grace_seconds=args.initial_grace_seconds,
     )
 
     # Step 9: optional second rerun pass.
@@ -708,6 +779,7 @@ def main() -> None:
             pass_index=2,
             poll_seconds=args.poll_seconds,
             dry_run=args.dry_run,
+            initial_grace_seconds=args.initial_grace_seconds,
         )
     else:
         print("[STEP 9] No second rerun pass needed.")

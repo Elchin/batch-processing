@@ -14,6 +14,7 @@ from batch_processing.cmd.base import BaseCommand
 from batch_processing.utils.utils import (
     create_slurm_script,
     interpret_path,
+    mpirun_rank_flags,
     update_config,
     get_gcsfs,
     get_cluster,
@@ -125,7 +126,7 @@ class BatchSplitCommand(BaseCommand):
             scenario_continuation=scenario_continuation,
             restart_from=restart_from,
         )
-        mpi_ranks = max(1, int(getattr(self._args, "mpi_ranks", 1)))
+        mpi_ranks = getattr(self._args, "mpi_ranks", None)
 
         if self._args.job_name_prefix:
             job_name = f"{self._args.job_name_prefix}-{self.base_batch_dir.name}-batch-{index}"
@@ -151,7 +152,7 @@ class BatchSplitCommand(BaseCommand):
             "n": self._args.n,
             "additional_flags": additional_flags,
             "flags_before_max_output": flags_before_max_output,
-            "mpi_ranks": mpi_ranks,
+            "mpirun_rank_flags": mpirun_rank_flags(mpi_ranks),
         }
 
         script_path = batch_dir / "slurm_runner.sh"

@@ -423,6 +423,17 @@ def get_batch_folders(path: Path) -> List[Path]:
     return batch_folders
 
 
+def mpirun_rank_flags(mpi_ranks: int | None) -> str:
+    """Return mpirun rank flags for slurm_runner.sh.
+
+    Default (mpi_ranks is None): one rank per hardware thread.
+    Explicit mpi_ranks: fixed ``mpirun -n N``.
+    """
+    if mpi_ranks is None:
+        return "--use-hwthread-cpus"
+    return f"-n {max(1, int(mpi_ranks))}"
+
+
 def render_slurm_job_script(template_name: str, values: dict) -> str:
     """Reads the specified template file and populates it with the given values.
 
