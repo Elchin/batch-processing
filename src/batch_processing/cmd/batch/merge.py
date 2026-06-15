@@ -148,24 +148,46 @@ class BatchMergeCommand(BaseCommand):
         if not data_vars_info:
             all_dims = set(first_ds.dims.keys())
         
+        layout_path = self.base_batch_dir / "batch_layout.json"
+        blocks = None
+        full_X, full_Y = None, None
+        if layout_path.exists():
+            import json
+            with open(layout_path) as f:
+                layout = json.load(f)
+                blocks = layout["blocks"]
+                full_X = layout.get("X")
+                full_Y = layout.get("Y")
+
         # Calculate total canvas size
         total_batch_count = len(available_batches)
         canvas_dims = {}
         canvas_coords = {}
         
         for dim in all_dims:
-            if dim == concat_dim:
-                # This is the dimension we're concatenating along
-                canvas_dims[dim] = first_ds[dim].shape[0] * total_batch_count
-                # Create extended coordinates for the canvas
-                if dim == 'y':
-                    canvas_coords[dim] = np.arange(canvas_dims[dim])
-                elif dim == 'Y':
-                    canvas_coords[dim] = np.arange(canvas_dims[dim])
+            if blocks is not None and full_X is not None and full_Y is not None:
+                if dim == 'y' or dim == 'Y':
+                    canvas_dims[dim] = full_Y
+                    canvas_coords[dim] = np.arange(full_Y)
+                elif dim == 'x' or dim == 'X':
+                    canvas_dims[dim] = full_X
+                    canvas_coords[dim] = np.arange(full_X)
+                else:
+                    canvas_dims[dim] = first_ds[dim].shape[0]
+                    canvas_coords[dim] = first_ds[dim].values
             else:
-                # Keep original dimensions
-                canvas_dims[dim] = first_ds[dim].shape[0]
-                canvas_coords[dim] = first_ds[dim].values
+                if dim == concat_dim:
+                    # This is the dimension we're concatenating along
+                    canvas_dims[dim] = first_ds[dim].shape[0] * total_batch_count
+                    # Create extended coordinates for the canvas
+                    if dim == 'y':
+                        canvas_coords[dim] = np.arange(canvas_dims[dim])
+                    elif dim == 'Y':
+                        canvas_coords[dim] = np.arange(canvas_dims[dim])
+                else:
+                    # Keep original dimensions
+                    canvas_dims[dim] = first_ds[dim].shape[0]
+                    canvas_coords[dim] = first_ds[dim].values
         
         # Create canvas dataset with all data variables
         data_vars = {}
@@ -190,38 +212,86 @@ class BatchMergeCommand(BaseCommand):
         """Fill the canvas with data from available batch files."""
         print(f"Filling canvas for {output_file}")
         
+        layout_path = self.base_batch_dir / "batch_layout.json"
+        blocks = None
+        if layout_path.exists():
+            import json
+            with open(layout_path) as f:
+                layout = json.load(f)
+                blocks = layout["blocks"]
+
         # Read all available files
         datasets = []
         for file_path in available_files:
             ds = xr.open_dataset(file_path, engine="h5netcdf", decode_times=False)
             datasets.append(ds)
         
-        # Concatenate along the specified dimension
-        if datasets:
-            #combined_ds = xr.concat(datasets, dim=concat_dim)
-            combined_ds = xr.concat(
-                datasets,
-                dim=concat_dim,
-                data_vars="minimal",
-                coords="minimal",
-                compat="override",
-            )
-            
-            # Fill the canvas with the combined data
-            if concat_dim == 'y':
-                # For y dimension, we need to map the combined data to the canvas
-                canvas_slice = {concat_dim: slice(0, combined_ds[concat_dim].shape[0])}
-                canvas = combined_ds.sel(canvas_slice).combine_first(canvas)
-            elif concat_dim == 'Y':
-                canvas_slice = {concat_dim: slice(0, combined_ds[concat_dim].shape[0])}
-                canvas = combined_ds.sel(canvas_slice).combine_first(canvas)
-            else:
-                canvas = combined_ds.combine_first(canvas)
-            
+        if blocks is not None:
+            # Place data directly into canvas using 2D blocks
+            for batch_idx, ds in zip(batch_coords, datasets):
+                y_start, y_end, x_start, x_end = blocks[batch_idx]
+                
+                for var_name in ds.data_vars:
+                    # Construct slices for this variable
+                    var_slices = {}
+                    has_y = False
+                    has_x = False
+                    
+                    if 'y' in canvas[var_name].dims:
+                        var_slices['y'] = slice(y_start, y_end)
+                        has_y = True
+                    elif 'Y' in canvas[var_name].dims:
+                        var_slices['Y'] = slice(y_start, y_end)
+                        has_y = True
+                        
+                    if 'x' in canvas[var_name].dims:
+                        var_slices['x'] = slice(x_start, x_end)
+                        has_x = True
+                    elif 'X' in canvas[var_name].dims:
+                        var_slices['X'] = slice(x_start, x_end)
+                        has_x = True
+                    
+                    if has_y or has_x:
+                        # Ensure we get the properly sized numpy slice from the dataset
+                        # By selecting the spatial slices we want to fill
+                        try:
+                            canvas[var_name].loc[var_slices] = ds[var_name].values
+                        except ValueError as e:
+                            # if dimensions mismatch, fallback to combine_first or something
+                            print(f"Warning: dimension mismatch for {var_name}: {e}")
+                    else:
+                        # variable has no spatial dimensions
+                        canvas[var_name].loc[...] = ds[var_name].values
+
             # Close datasets to free memory
             for ds in datasets:
                 ds.close()
-            combined_ds.close()
+        else:
+            # Concatenate along the specified dimension (original behavior)
+            if datasets:
+                #combined_ds = xr.concat(datasets, dim=concat_dim)
+                combined_ds = xr.concat(
+                    datasets,
+                    dim=concat_dim,
+                    data_vars="minimal",
+                    coords="minimal",
+                    compat="override",
+                )
+                
+                # Fill the canvas with the combined data
+                if concat_dim == 'y':
+                    canvas_slice = {concat_dim: slice(0, combined_ds[concat_dim].shape[0])}
+                    canvas = combined_ds.sel(canvas_slice).combine_first(canvas)
+                elif concat_dim == 'Y':
+                    canvas_slice = {concat_dim: slice(0, combined_ds[concat_dim].shape[0])}
+                    canvas = combined_ds.sel(canvas_slice).combine_first(canvas)
+                else:
+                    canvas = combined_ds.combine_first(canvas)
+                
+                # Close datasets to free memory
+                for ds in datasets:
+                    ds.close()
+                combined_ds.close()
         
         return canvas
 
@@ -420,14 +490,28 @@ class BatchMergeCommand(BaseCommand):
         has_missing_batch_dirs = len(available_batches) < total_expected_batches
         has_unequal_files = not equal_files_check
         
-        # Use canvas approach if we have missing batch directories OR unequal file counts
-        should_use_canvas = has_missing_batch_dirs or has_unequal_files
+        layout_path = self.base_batch_dir / "batch_layout.json"
+        is_2d_split = False
+        if layout_path.exists():
+            import json
+            with open(layout_path) as f:
+                layout = json.load(f)
+                blocks = layout.get("blocks", [])
+                if len(blocks) > 0:
+                    # check if x_start != 0 or x_end != X
+                    if blocks[0][2] != 0 or blocks[0][3] != layout.get("X"):
+                        is_2d_split = True
+        
+        # Use canvas approach if we have missing batch directories OR unequal file counts OR 2D splitting
+        should_use_canvas = has_missing_batch_dirs or has_unequal_files or is_2d_split
 
         if should_use_canvas:
             if has_missing_batch_dirs:
                 print(f"Missing batch directories detected ({len(available_batches)}/{total_expected_batches} available). Using canvas approach.")
             if has_unequal_files:
                 print("Unequal output file counts detected across batches. Using canvas approach.")
+            if is_2d_split:
+                print("2D chunking layout detected. Using canvas approach to assemble blocks.")
             
             # Use canvas approach for all files
             for output_file in output_files:

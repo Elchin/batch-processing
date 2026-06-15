@@ -160,38 +160,117 @@ class BatchSplitCommand(BaseCommand):
             script_path.as_posix(), "slurm_runner.sh", substitution_values
         )
 
-    def _split_with_nco(
-        self, start_index: int, end_index: int, input_path: Path, split_dimension: str
+    def _split_with_xarray_local(
+        self, blocks: list, input_path: Path
     ) -> None:
-        for input_file in INPUT_FILES:
+        import dask
+        n_years = getattr(self._args, "n", 0)
+        files_to_split = [f for f in INPUT_FILES if n_years > 0 or not f.startswith("projected-")]
+        
+        chunk_y = blocks[0][1] - blocks[0][0] if blocks else 1
+        chunk_x = blocks[0][3] - blocks[0][2] if blocks else 1
+
+        cmt0_filter = getattr(self._args, "cmt0_filter", False)
+        no_max_cmt = getattr(self._args, "no_max_cmt", False)
+        max_cmt_val = getattr(self._args, "max_cmt", 74)
+        
+        veg_ds = None
+        if (cmt0_filter or not no_max_cmt) and "vegetation.nc" in files_to_split:
+            veg_path = input_path / "vegetation.nc"
+            if veg_path.exists():
+                veg_ds = xr.open_dataset(veg_path, engine="netcdf4", decode_times=False)
+
+        for input_file in files_to_split:
             src_input_path = input_path / input_file
-            print("splitting ", src_input_path)
-            for index in range(start_index, end_index):
+            if not src_input_path.exists():
+                print(f"Warning: {src_input_path} does not exist, skipping.")
+                continue
+            print("splitting ", src_input_path, "using xarray")
+            
+            if input_file in [
+                "historic-climate.nc",
+                "historic-explicit-fire.nc",
+                "projected-climate.nc",
+                "projected-explicit-fire.nc",
+            ]:
+                chunk_dict = {"Y": chunk_y, "X": chunk_x, "time": -1}
+            else:
+                chunk_dict = {"Y": chunk_y, "X": chunk_x}
+
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    ds = xr.open_dataset(src_input_path, engine="netcdf4", chunks=chunk_dict, decode_times=False)
+                except Exception as e:
+                    print(f"Fallback for {input_file} due to {e}")
+                    ds = xr.open_dataset(src_input_path, engine="h5netcdf", chunks=chunk_dict, decode_times=False)
+
+            if input_file == "run-mask.nc" and (cmt0_filter or not no_max_cmt) and veg_ds is not None and "veg_class" in veg_ds:
+                ds = ds.load()
+                veg_data = veg_ds["veg_class"].values
+                import numpy as np
+                if cmt0_filter:
+                    ds["run"].values = np.where(veg_data == 0, 0, ds["run"].values)
+                if not no_max_cmt:
+                    ds["run"].values = np.where(veg_data > max_cmt_val, 0, ds["run"].values)
+
+            delayed_writes = []
+            for index, (y_start, y_end, x_start, x_end) in enumerate(blocks):
                 path = os.path.join(BATCH_INPUT_DIRS[index], input_file)
-                subprocess.run(
-                    [
-                        "ncks",
-                        "-O",
-                        "-h",
-                        "-d",
-                        f"{split_dimension},{index}",
-                        src_input_path,
-                        path,
-                    ]
-                )
+                subset = ds.isel({"Y": slice(y_start, y_end), "X": slice(x_start, x_end)})
+                # Always use engine="netcdf4" to avoid H5DSis_scale bug
+                delayed_obj = subset.to_netcdf(path, engine="netcdf4", compute=False)
+                delayed_writes.append(delayed_obj)
+                
+            batch_size = 125
+            for i in range(0, len(delayed_writes), batch_size):
+                print(f"Computing batch number {(i // batch_size) + 1} of {(len(delayed_writes) + batch_size - 1) // batch_size}")
+                batch = delayed_writes[i : i + batch_size]
+                dask.compute(*batch)
+                
+            ds.close()
             print("done splitting ", input_file)
 
-    def _split_with_dask(self, bucket_path):
+        if veg_ds is not None:
+            veg_ds.close()
+
+    def _split_with_dask(self, bucket_path, blocks):
         cluster = get_cluster(n_workers=100)
         client = dask.distributed.Client(cluster)
         client.wait_for_workers(50)
         print(f"Dashboard link: {client.dashboard_link}")
         fs = get_gcsfs()
-        for input_file in INPUT_FILES_TO_SPLIT:
+        
+        # Calculate chunk sizes based on the first block (assuming relatively uniform blocks)
+        chunk_y = blocks[0][1] - blocks[0][0] if blocks else 1
+        chunk_x = blocks[0][3] - blocks[0][2] if blocks else 1
+        
+        n_years = getattr(self._args, "n", 0)
+        files_to_split = [f for f in INPUT_FILES_TO_SPLIT if n_years > 0 or not f.startswith("projected-")]
+        
+        cmt0_filter = getattr(self._args, "cmt0_filter", False)
+        no_max_cmt = getattr(self._args, "no_max_cmt", False)
+        max_cmt_val = getattr(self._args, "max_cmt", 74)
+        
+        veg_ds = None
+        if (cmt0_filter or not no_max_cmt) and "vegetation.zarr" in files_to_split:
+            try:
+                veg_mapping = fs.get_mapper(os.path.join(bucket_path, "vegetation.zarr"), check=True)
+                veg_ds = xr.open_zarr(veg_mapping, decode_times=False)
+            except Exception as e:
+                print(f"Warning: could not open vegetation.zarr for cmt filtering: {e}")
+
+        for input_file in files_to_split:
             print(f"Processing {input_file}")
-            bucket_mapping = fs.get_mapper(
-                os.path.join(bucket_path, input_file), check=True
-            )
+            try:
+                bucket_mapping = fs.get_mapper(
+                    os.path.join(bucket_path, input_file), check=True
+                )
+            except Exception as e:
+                print(f"Warning: could not open {input_file} in bucket, skipping. ({e})")
+                continue
+                
             ds = xr.open_zarr(bucket_mapping, decode_times=False)
             if input_file in [
                 "historic-climate.zarr",
@@ -199,23 +278,31 @@ class BatchSplitCommand(BaseCommand):
                 "projected-climate.zarr",
                 "projected-explicit-fire.zarr",
             ]:
-                chunk_dict = {"Y": 1, "X": -1, "time": -1}
+                chunk_dict = {"Y": chunk_y, "X": chunk_x, "time": -1}
             else:
-                chunk_dict = {"Y": 1, "X": -1}
+                chunk_dict = {"Y": chunk_y, "X": chunk_x}
 
             ds = ds.chunk(chunk_dict)
-            y_dim = ds.Y.size
+
+            if input_file == "run-mask.zarr" and (cmt0_filter or not no_max_cmt) and veg_ds is not None and "veg_class" in veg_ds:
+                ds = ds.load()
+                veg_data = veg_ds["veg_class"].values
+                import numpy as np
+                if cmt0_filter:
+                    ds["run"].values = np.where(veg_data == 0, 0, ds["run"].values)
+                if not no_max_cmt:
+                    ds["run"].values = np.where(veg_data > max_cmt_val, 0, ds["run"].values)
 
             # I know this is ugly but passing `ds` as an argument makes things painfully slow
             @dask.delayed
-            def _process_data(col_index, output_path):
-                subset = ds.isel({"Y": col_index}).expand_dims("Y")
+            def _process_data(y_start, y_end, x_start, x_end, output_path):
+                subset = ds.isel({"Y": slice(y_start, y_end), "X": slice(x_start, x_end)})
                 obj = subset.to_netcdf(output_path, engine="h5netcdf")
                 return obj
 
             delayed_objs = [
                 _process_data(
-                    i,
+                    b[0], b[1], b[2], b[3],
                     os.path.join(
                         self.base_batch_dir,
                         f"batch_{i}",
@@ -223,19 +310,35 @@ class BatchSplitCommand(BaseCommand):
                         f"{input_file[:len(input_file)-5]}.nc",
                     ),
                 )
-                for i in range(y_dim)
+                for i, b in enumerate(blocks)
             ]
             batch_size = 125
-            for i in range(0, y_dim, batch_size):
+            for i in range(0, len(blocks), batch_size):
                 print(f"Computing batch number {(i // batch_size) + 1}")
                 batch = delayed_objs[i : i + batch_size]
                 dask.compute(*batch)
 
             ds.close()
 
+        if veg_ds is not None:
+            veg_ds.close()
+
         cluster.close()
 
     def execute(self):
+        slurm_partition = getattr(self._args, "slurm_partition", "spot")
+        mpi_ranks = getattr(self._args, "mpi_ranks", None)
+        if mpi_ranks is not None:
+            max_cpus = {"spot": 8, "dask": 4, "compute": 15}.get(slurm_partition, 8)
+            if int(mpi_ranks) > max_cpus:
+                import typer
+                typer.secho(
+                    f"Error: The requested --mpi-ranks ({mpi_ranks}) exceeds the maximum number of CPUs ({max_cpus}) available per node for the '{slurm_partition}' partition.",
+                    err=True, fg=typer.colors.RED
+                )
+                import sys
+                sys.exit(1)
+
         reading_remote_data = False
         if self.input_path.startswith("gcs://"):
             self.input_path = self.input_path.replace("gcs://", "")
@@ -261,12 +364,63 @@ class BatchSplitCommand(BaseCommand):
         X, Y = ds.X.size, ds.Y.size
         print("Dimension size of X:", X)
         print("Dimension size of Y:", Y)
+        
+        import numpy as np
+        run_data = None
+        if "run" in ds:
+            run_data = ds["run"].values
+            run_data = np.where(np.isnan(run_data), 0, run_data)
+            
+            cmt0_filter = getattr(self._args, "cmt0_filter", False)
+            no_max_cmt = getattr(self._args, "no_max_cmt", False)
+            max_cmt_val = getattr(self._args, "max_cmt", 74)
+            
+            if cmt0_filter or not no_max_cmt:
+                veg_path = self.input_path / "vegetation.nc"
+                if veg_path.exists():
+                    veg_ds = xr.open_dataset(veg_path, engine="netcdf4", decode_times=False)
+                    if "veg_class" in veg_ds:
+                        veg_data = veg_ds["veg_class"].values
+                        if cmt0_filter:
+                            run_data = np.where(veg_data == 0, 0, run_data)
+                        if not no_max_cmt:
+                            run_data = np.where(veg_data > max_cmt_val, 0, run_data)
+                    veg_ds.close()
 
-        # always split across y dimension
-        SPLIT_DIMENSION, DIMENSION_SIZE = "Y", Y
+        cells_per_batch = getattr(self._args, "cells_per_batch", None)
+        blocks = []
+        if cells_per_batch is not None and cells_per_batch > 0:
+            import math
+            cx = min(X, int(math.sqrt(cells_per_batch)))
+            cy = min(Y, max(1, cells_per_batch // cx))
+            for y_start in range(0, Y, cy):
+                y_end = min(Y, y_start + cy)
+                for x_start in range(0, X, cx):
+                    x_end = min(X, x_start + cx)
+                    blocks.append((y_start, y_end, x_start, x_end))
+            print(f"\nInitial split yielded {len(blocks)} blocks of max size {cells_per_batch}")
+        else:
+            SPLIT_DIMENSION = "Y"
+            print(f"\nSplitting across {SPLIT_DIMENSION} dimension")
+            print("Dimension size:", Y)
+            for y in range(Y):
+                blocks.append((y, y + 1, 0, X))
 
-        print(f"\nSplitting accros {SPLIT_DIMENSION} dimension")
-        print("Dimension size:", DIMENSION_SIZE)
+        # Filter active blocks
+        active_blocks = []
+        for b in blocks:
+            y_start, y_end, x_start, x_end = b
+            if run_data is not None:
+                # handle cases where run_data might have more than 2 dimensions (e.g. time)
+                subset = run_data[..., y_start:y_end, x_start:x_end]
+                if (subset == 1).any():
+                    active_blocks.append(b)
+            else:
+                active_blocks.append(b)
+        
+        blocks = active_blocks
+        DIMENSION_SIZE = len(blocks)
+        print(f"Filtered to {DIMENSION_SIZE} active batches")
 
         ds.close()
 
@@ -285,6 +439,12 @@ class BatchSplitCommand(BaseCommand):
         print("Set up batch directories")
         self.base_batch_dir.mkdir(exist_ok=True)
         self.log_path.mkdir(exist_ok=True)
+
+        # write layout to json
+        import json
+        with open(self.base_batch_dir / "batch_layout.json", "w") as f:
+            json.dump({"blocks": blocks, "X": X, "Y": Y}, f)
+
         for index in range(DIMENSION_SIZE):
             path = self.base_batch_dir / f"batch_{index}"
             BATCH_DIRS.append(path)
@@ -295,25 +455,32 @@ class BatchSplitCommand(BaseCommand):
         with ThreadPoolExecutor(max_workers=os.cpu_count() * 2) as executor:
             executor.map(lambda elem: os.makedirs(elem), BATCH_INPUT_DIRS)
 
-        co2_files = ["co2.zarr/", "projected-co2.zarr/"]
+        n_years = getattr(self._args, "n", 0)
+        co2_files = ["co2.zarr/"]
+        if n_years > 0:
+            co2_files.append("projected-co2.zarr/")
+            
         if reading_remote_data:
             for co2_file in co2_files:
                 src = os.path.join(self.input_path, co2_file)
                 dst = os.path.join(self.base_batch_dir, co2_file)
-                fs.get(src, dst, recursive=True)
+                try:
+                    fs.get(src, dst, recursive=True)
 
-                ds = xr.open_zarr(dst)
-                co2_file = Path(co2_file)
-                ds.to_netcdf(
-                    os.path.join(self.base_batch_dir, f"{co2_file.stem}.nc"),
-                    engine="h5netcdf",
-                )
-                ds.close()
-                shutil.rmtree(dst)
+                    ds = xr.open_zarr(dst)
+                    co2_file_path = Path(co2_file)
+                    ds.to_netcdf(
+                        os.path.join(self.base_batch_dir, f"{co2_file_path.stem}.nc"),
+                        engine="h5netcdf",
+                    )
+                    ds.close()
+                    shutil.rmtree(dst)
+                except Exception as e:
+                    print(f"Warning: Failed to process {co2_file}: {e}")
 
         # co2.nc and projected-co2.nc doesn't have X and Y dimensions. So, we copy
         # them instead of splitting.
-        print("Copy co2.nc and projected-co2.nc files")
+        print("Copy co2.nc and projected-co2.nc files (if needed)")
         co2_dest = self.input_path
         if reading_remote_data:
             co2_dest = self.base_batch_dir
@@ -321,21 +488,28 @@ class BatchSplitCommand(BaseCommand):
         for batch_dir in BATCH_INPUT_DIRS:
             src_co2 = co2_dest / "co2.nc"
             dst_co2 = batch_dir / "co2.nc"
-            shutil.copy(src_co2, dst_co2)
+            if src_co2.exists():
+                shutil.copy(src_co2, dst_co2)
 
-            src_projected_co2 = co2_dest / "projected-co2.nc"
-            dst_projected_co2 = batch_dir / "projected-co2.nc"
-            shutil.copy(src_projected_co2, dst_projected_co2)
+            if n_years > 0:
+                src_projected_co2 = co2_dest / "projected-co2.nc"
+                dst_projected_co2 = batch_dir / "projected-co2.nc"
+                if src_projected_co2.exists():
+                    shutil.copy(src_projected_co2, dst_projected_co2)
 
         if reading_remote_data:
-            os.remove(os.path.join(co2_dest, "co2.nc"))
-            os.remove(os.path.join(co2_dest, "projected-co2.nc"))
+            co2_nc = os.path.join(co2_dest, "co2.nc")
+            if os.path.exists(co2_nc):
+                os.remove(co2_nc)
+            proj_co2_nc = os.path.join(co2_dest, "projected-co2.nc")
+            if os.path.exists(proj_co2_nc):
+                os.remove(proj_co2_nc)
 
         print("Split input files")
         if reading_remote_data:
-            self._split_with_dask(self.input_path)
+            self._split_with_dask(self.input_path, blocks)
         else:
-            self._split_with_nco(0, DIMENSION_SIZE, self.input_path, SPLIT_DIMENSION)
+            self._split_with_xarray_local(blocks, self.input_path)
 
         print("Set up the batch simulation")
         for batch_dir, batch_input_dir in zip(BATCH_DIRS, BATCH_INPUT_DIRS):

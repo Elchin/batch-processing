@@ -298,6 +298,11 @@ def batch_split(
             "with /mnt/exacloud/$USER"
         ),
     ),
+    cells_per_batch: Optional[int] = typer.Option(
+        None,
+        "--cells-per-batch",
+        help="Maximum number of grid cells per batch. If provided, partitions across both X and Y dimensions."
+    ),
     p: int = typer.Option(0, help="Number of PRE RUN years to run. By default, 0"),
     e: int = typer.Option(0, help="Number of EQUILIBRIUM years to run. By default, 0"),
     s: int = typer.Option(0, help="Number of SPINUP years to run. By default, 0"),
@@ -338,14 +343,38 @@ def batch_split(
             "If omitted, slurm_runner uses mpirun --use-hwthread-cpus."
         ),
     ),
+    cmt0_filter: bool = typer.Option(
+        False,
+        "--cmt0-filter/--no-cmt0-filter",
+        help="Disable run-mask cells where veg_class==0 (CMT 0).",
+    ),
+    max_cmt: int = typer.Option(
+        _DEFAULT_MAX_CMT,
+        "--max-cmt",
+        metavar="N",
+        help=(
+            "Disable run-mask cells where vegetation.nc veg_class > N. "
+            f"Default threshold is {_DEFAULT_MAX_CMT}; omit this flag to use that default."
+        ),
+    ),
+    no_max_cmt: bool = typer.Option(
+        False,
+        "--no-max-cmt",
+        help=(
+            "Disable the max-CMT run-mask filter (veg_class > N). "
+            "By default the filter runs with the --max-cmt threshold."
+        ),
+    ),
 ):
     """Split the given input data into smaller batches."""
+    _require_max_cmt_argv_has_int()
     # Create args object for compatibility with command class
     all_args = {
         "slurm_partition": slurm_partition.value,
         "input_path": input_path,
         "launch_as_job": launch_as_job,
         "batches": batches,
+        "cells_per_batch": cells_per_batch,
         "p": p,
         "e": e,
         "s": s,
@@ -357,6 +386,9 @@ def batch_split(
         "scenario_continuation": scenario_continuation,
         "restart_from": restart_from,
         "mpi_ranks": mpi_ranks,
+        "cmt0_filter": cmt0_filter,
+        "max_cmt": max_cmt,
+        "no_max_cmt": no_max_cmt,
     }
     args = type("Args", (), all_args)()
     BatchSplitCommand(args).execute()

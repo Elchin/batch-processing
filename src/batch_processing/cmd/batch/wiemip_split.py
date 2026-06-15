@@ -79,9 +79,16 @@ class WiemipSplitCommand(BatchSplitCommand):
         copy_files: List[Tuple[Path, str]] = []
         destination_names = {}
         run_mask_source: Path | None = None
+        
+        n_years = getattr(self._args, "n", 0)
 
         for src in netcdf_files:
             dst_name = self._resolve_destination_name(src.name)
+            
+            if n_years == 0 and dst_name.startswith("projected-"):
+                print(f"Skipping {src.name} because --n is not specified (n=0)")
+                continue
+                
             if dst_name in destination_names:
                 conflicting = destination_names[dst_name]
                 raise ValueError(
@@ -369,15 +376,18 @@ class WiemipSplitCommand(BatchSplitCommand):
         if not run_mask_file.exists():
             raise FileNotFoundError(f"Missing run-mask for prefilter: {run_mask_file}")
 
+        n_years = getattr(self._args, "n", 0)
+        expected_climate_files = [f for f in CLIMATE_INPUT_FILENAMES if n_years > 0 or not f.startswith("projected-")]
+        
         climate_files = [
             batch_input_dir / fname
-            for fname in CLIMATE_INPUT_FILENAMES
+            for fname in expected_climate_files
             if (batch_input_dir / fname).exists()
         ]
         if not climate_files:
             raise FileNotFoundError(
                 f"No climate files found in {batch_input_dir}. "
-                f"Expected one of {CLIMATE_INPUT_FILENAMES}."
+                f"Expected one of {expected_climate_files}."
             )
 
         with open_dataset_for_read(run_mask_file) as run_mask_ds:
@@ -663,6 +673,19 @@ class WiemipSplitCommand(BatchSplitCommand):
 
     def execute(self) -> None:
         print("[wiemip_split] Starting integrated WIEMIP split workflow")
+        slurm_partition = getattr(self._args, "slurm_partition", "spot")
+        mpi_ranks = getattr(self._args, "mpi_ranks", None)
+        if mpi_ranks is not None:
+            max_cpus = {"spot": 8, "dask": 4, "compute": 15}.get(slurm_partition, 8)
+            if int(mpi_ranks) > max_cpus:
+                import typer
+                typer.secho(
+                    f"Error: The requested --mpi-ranks ({mpi_ranks}) exceeds the maximum number of CPUs ({max_cpus}) available per node for the '{slurm_partition}' partition.",
+                    err=True, fg=typer.colors.RED
+                )
+                import sys
+                sys.exit(1)
+
         if str(self.input_path).startswith("gcs://"):
             raise NotImplementedError(
                 "bp batch wiemip_split currently supports local input paths only."
