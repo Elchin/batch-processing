@@ -627,10 +627,45 @@ def main() -> None:
     print(f"[INFO] Input path: {input_path}")
     print(f"[INFO] Split path: {split_path}")
 
-    # Step 0: Determine nbatches from active bbox row count.
-    nbatches = determine_nbatches(input_path)
-    max_batch_id = nbatches - 1
-    print(f"[STEP 0] Computed nbatches={nbatches} (max batch id: {max_batch_id})")
+    # Step 1: Standard batch split.
+    split_cmd = [
+        "bp",
+        "batch",
+        "split",
+        "-i",
+        input_path.as_posix(),
+        "-b",
+        split_path.as_posix(),
+        "--cells-per-batch",
+        "160",
+        "--mpi-ranks",
+        "8",
+        "--restart_from",
+        "",
+        "-p",
+        str(args.p),
+        "-e",
+        str(args.e),
+        "-s",
+        str(args.s),
+        "-t",
+        str(args.t),
+    ]
+    if args.slurm_partition:
+        split_cmd.extend(["-sp", args.slurm_partition])
+    if args.cmt0_filter:
+        split_cmd.append("--cmt0-filter")
+    if args.no_max_cmt:
+        split_cmd.append("--no-max-cmt")
+    else:
+        split_cmd.extend(["--max-cmt", str(args.max_cmt)])
+    run_cmd(split_cmd, dry_run=args.dry_run)
+
+    # Step 1.1: Determine nbatches dynamically after the split is done.
+    batch_dirs = get_batch_dirs(split_path)
+    nbatches = len(batch_dirs)
+    max_batch_id = nbatches - 1 if nbatches > 0 else 0
+    print(f"[INFO] Split produced {nbatches} batches (max batch id: {max_batch_id}).")
 
     if restart_from_path is not None:
         _validate_option2_restart(
@@ -649,40 +684,6 @@ def main() -> None:
             no_max_cmt=args.no_max_cmt,
             max_cmt=args.max_cmt,
         )
-
-    # Step 1: WIEMIP split.
-    split_cmd = [
-        "bp",
-        "batch",
-        "wiemip_split",
-        "-i",
-        input_path.as_posix(),
-        "-b",
-        split_path.as_posix(),
-        "-N",
-        str(nbatches),
-        "--restart_from",
-        "",
-        "-p",
-        str(args.p),
-        "-e",
-        str(args.e),
-        "-s",
-        str(args.s),
-        "-t",
-        str(args.t),
-    ]
-    if args.slurm_partition:
-        split_cmd.extend(["-sp", args.slurm_partition])
-    if not args.runmask_prefilter:
-        split_cmd.append("--no-runmask-prefilter")
-    if args.cmt0_filter:
-        split_cmd.append("--cmt0-filter")
-    if args.no_max_cmt:
-        split_cmd.append("--no-max-cmt")
-    else:
-        split_cmd.extend(["--max-cmt", str(args.max_cmt)])
-    run_cmd(split_cmd, dry_run=args.dry_run)
 
     # Step 1.5: Seed restart files from source split run into new batch output dirs.
     if restart_from_path is not None:
@@ -793,13 +794,13 @@ def main() -> None:
     else:
         print("[INFO] All batches complete after rerun passes.")
 
-    # Step 10: final WIEMIP merge.
-    run_cmd(["bp", "batch", "wiemip_merge", "-b", split_path.as_posix()], dry_run=False)
+    # Step 10: final standard merge.
+    run_cmd(["bp", "batch", "merge", "-b", split_path.as_posix()], dry_run=False)
 
     # Step 11: plot merged outputs.
-    merged_restored = split_path / "wiemip_merged" / "merged_restored"
+    merged_restored = split_path / "all_merged"
     if not merged_restored.exists():
-        raise FileNotFoundError(f"Merged restored output directory not found: {merged_restored}")
+        raise FileNotFoundError(f"Merged output directory not found: {merged_restored}")
     if not plot_script.exists():
         raise FileNotFoundError(f"Plot script not found: {plot_script}")
 
@@ -807,7 +808,7 @@ def main() -> None:
         [sys.executable, plot_script.as_posix(), merged_restored.as_posix()],
         dry_run=False,
     )
-    print("[DONE] WIEMIP end-to-end workflow finished.")
+    print("[DONE] End-to-end workflow finished.")
 
 
 if __name__ == "__main__":
