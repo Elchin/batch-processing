@@ -259,12 +259,21 @@ class WiemipReRunCommand(BaseCommand):
             content = "\n".join(lines) + "\n"
 
         def replace_log_path(match: re.Match[str]) -> str:
-            old_log_path = match.group(1)
-            if old_log_path.endswith("-retry"):
+            flag = match.group(1)
+            old_log_path = match.group(2)
+            if "-retry" in old_log_path:
                 return match.group(0)
-            return f"#SBATCH -o {old_log_path}-retry"
+            if old_log_path.endswith((".out", ".err")):
+                base, ext = old_log_path.rsplit(".", 1)
+                return f"#SBATCH {flag} {base}-retry.{ext}"
+            return f"#SBATCH {flag} {old_log_path}-retry"
 
-        content = re.sub(r"^#SBATCH -o\s+(.+)$", replace_log_path, content, flags=re.MULTILINE)
+        content = re.sub(
+            r"^#SBATCH (-o|-e)\s+(.+)$",
+            replace_log_path,
+            content,
+            flags=re.MULTILINE,
+        )
 
         with open(self.retry_slurm_path, "w", encoding="utf-8") as file_obj:
             file_obj.write(content)

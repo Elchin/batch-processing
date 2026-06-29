@@ -25,6 +25,9 @@ BatchSplitCommand = lazy_import.lazy_class(
 BatchRunCommand = lazy_import.lazy_class(
     "batch_processing.cmd.batch.run.BatchRunCommand"
 )
+SuggestSplitCommand = lazy_import.lazy_class(
+    "batch_processing.cmd.batch.suggest_split.SuggestSplitCommand"
+)
 BatchMergeCommand = lazy_import.lazy_class(
     "batch_processing.cmd.batch.merge.BatchMergeCommand"
 )
@@ -394,6 +397,107 @@ def batch_split(
     BatchSplitCommand(args).execute()
 
 
+@batch_app.command("suggest-split")
+def batch_suggest_split(
+    input_path: str = typer.Option(
+        ...,
+        "--input-path",
+        "-i",
+        help="WIEMIP setup directory containing run-mask.nc (and optional vegetation.nc).",
+    ),
+    batches: Optional[str] = typer.Option(
+        None,
+        "--batches",
+        "-b",
+        help="Optional split output path to include in example commands.",
+    ),
+    target_batches: int = typer.Option(
+        100,
+        "--target-batches",
+        help="Desired number of active batches (default: 100).",
+    ),
+    target_walltime_hours: Optional[float] = typer.Option(
+        None,
+        "--target-walltime-hours",
+        help=(
+            "Optional target walltime per batch in hours. Requires --pilot-hours "
+            "and --pilot-batch-dir."
+        ),
+    ),
+    pilot_batch_dir: Optional[str] = typer.Option(
+        None,
+        "--pilot-batch-dir",
+        help="Completed or representative batch directory for timing calibration.",
+    ),
+    pilot_hours: Optional[float] = typer.Option(
+        None,
+        "--pilot-hours",
+        help="Measured walltime in hours for the pilot batch.",
+    ),
+    pilot_cells: Optional[int] = typer.Option(
+        None,
+        "--pilot-cells",
+        help="Override active-cell count for pilot timing when the pilot batch is too small.",
+    ),
+    mpi_ranks: int = typer.Option(
+        8,
+        "--mpi-ranks",
+        help="MPI ranks per batch job used for cells/rank guidance.",
+    ),
+    max_concurrent: int = typer.Option(
+        16,
+        "--max-concurrent",
+        help="Concurrent jobs assumed for experiment walltime estimate.",
+    ),
+    p: int = typer.Option(0, help="PRE-RUN years (for total-years / pilot scaling)."),
+    e: int = typer.Option(0, help="EQUILIBRIUM years."),
+    s: int = typer.Option(0, help="SPINUP years."),
+    t: int = typer.Option(0, help="TRANSIENT years."),
+    n: int = typer.Option(0, help="SCENARIO years."),
+    cmt0_filter: bool = typer.Option(
+        False,
+        "--cmt0-filter/--no-cmt0-filter",
+        help="Apply the same veg_class==0 mask filter used by batch split.",
+    ),
+    max_cmt: int = typer.Option(
+        _DEFAULT_MAX_CMT,
+        "--max-cmt",
+        metavar="N",
+        help="Apply the same veg_class > N mask filter used by batch split.",
+    ),
+    no_max_cmt: bool = typer.Option(
+        False,
+        "--no-max-cmt",
+        help="Disable max-CMT mask filter in the planning estimate.",
+    ),
+):
+    """Recommend cells-per-batch / nbatches from run-mask and optional pilot timing."""
+    args = type(
+        "Args",
+        (),
+        {
+            "input_path": input_path,
+            "batches": batches,
+            "target_batches": target_batches,
+            "target_walltime_hours": target_walltime_hours,
+            "pilot_batch_dir": pilot_batch_dir,
+            "pilot_hours": pilot_hours,
+            "pilot_cells": pilot_cells,
+            "mpi_ranks": mpi_ranks,
+            "max_concurrent": max_concurrent,
+            "p": p,
+            "e": e,
+            "s": s,
+            "t": t,
+            "n": n,
+            "cmt0_filter": cmt0_filter,
+            "max_cmt": max_cmt,
+            "no_max_cmt": no_max_cmt,
+        },
+    )()
+    SuggestSplitCommand(args).execute()
+
+
 @batch_app.command("wiemip_split")
 def batch_wiemip_split(
     slurm_partition: SlurmPartition = typer.Option(
@@ -547,13 +651,63 @@ def batch_run(
         "--batches",
         "-b",
         help=(
-            "Path to store the splitted batches. The given path will be concataned "
-            "with /mnt/exacloud/$USER"
+            "Path to the splitted batches (absolute, or relative to /mnt/exacloud/$USER)."
         ),
     ),
+    throttle: bool = typer.Option(
+        False,
+        "--throttle",
+        help=(
+            "Pause submission while the queue is full (max-concurrent / max-queue-depth). "
+            "Default submits all jobs immediately for Slurm to queue."
+        ),
+    ),
+    max_concurrent: int = typer.Option(
+        16,
+        "--max-concurrent",
+        help="With --throttle: max running jobs before pausing submission.",
+    ),
+    max_queue_depth: int = typer.Option(
+        32,
+        "--max-queue-depth",
+        help="With --throttle: max RUNNING+PENDING jobs before pausing submission.",
+    ),
+    submit_delay: float = typer.Option(
+        0.25,
+        "--submit-delay",
+        help="Seconds to sleep between individual sbatch calls.",
+    ),
+    poll_interval: int = typer.Option(
+        30,
+        "--poll-interval",
+        help="With --throttle: seconds between queue checks.",
+    ),
+    skip_complete: bool = typer.Option(
+        False,
+        "--skip-complete/--no-skip-complete",
+        help="Skip batches whose run_status.nc shows all active cells complete.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print submission plan without calling sbatch.",
+    ),
 ):
-    """Submit the batches to the Slurm queue."""
-    args = type("Args", (), {"batches": batches})()
+    """Submit all batch slurm_runner jobs (queued in Slurm by default)."""
+    args = type(
+        "Args",
+        (),
+        {
+            "batches": batches,
+            "throttle": throttle,
+            "max_concurrent": max_concurrent,
+            "max_queue_depth": max_queue_depth,
+            "submit_delay": submit_delay,
+            "poll_interval": poll_interval,
+            "skip_complete": skip_complete,
+            "dry_run": dry_run,
+        },
+    )()
     BatchRunCommand(args).execute()
 
 

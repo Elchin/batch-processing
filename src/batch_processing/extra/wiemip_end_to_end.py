@@ -482,6 +482,41 @@ def main() -> None:
         help="Queue polling interval in seconds (default: 300).",
     )
     parser.add_argument(
+        "--throttle",
+        action="store_true",
+        help=(
+            "Pause batch submission while the Slurm queue is full. "
+            "Default submits all jobs immediately for Slurm to queue."
+        ),
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=16,
+        help="With --throttle: max running jobs before pausing submission (default: 16).",
+    )
+    parser.add_argument(
+        "--max-queue-depth",
+        type=int,
+        default=32,
+        help=(
+            "With --throttle: max RUNNING+PENDING jobs before pausing submission "
+            "(default: 32)."
+        ),
+    )
+    parser.add_argument(
+        "--submit-delay",
+        type=float,
+        default=0.25,
+        help="Seconds to sleep between individual sbatch calls (default: 0.25).",
+    )
+    parser.add_argument(
+        "--submit-poll-seconds",
+        type=int,
+        default=30,
+        help="With --throttle: seconds between queue checks (default: 30).",
+    )
+    parser.add_argument(
         "--initial-grace-seconds",
         type=int,
         default=120,
@@ -616,6 +651,14 @@ def main() -> None:
         raise FileNotFoundError(f"Input run-mask missing: {input_path / 'run-mask.nc'}")
     if args.poll_seconds < 1:
         raise ValueError("--poll-seconds must be >= 1")
+    if args.submit_poll_seconds < 1:
+        raise ValueError("--submit-poll-seconds must be >= 1")
+    if args.throttle and args.max_concurrent < 1:
+        raise ValueError("--max-concurrent must be >= 1 when using --throttle")
+    if args.throttle and args.max_queue_depth < 1:
+        raise ValueError("--max-queue-depth must be >= 1 when using --throttle")
+    if args.submit_delay < 0:
+        raise ValueError("--submit-delay must be >= 0")
     if args.initial_grace_seconds < 0:
         raise ValueError("--initial-grace-seconds must be >= 0")
     restart_from_path: Path | None = None
@@ -729,8 +772,29 @@ def main() -> None:
             f"{missing_restart_count} missing source {args.restart_file}"
         )
 
-    # Step 2: Submit all batches.
-    run_cmd(["bp", "batch", "run", "-b", split_path.as_posix()], dry_run=args.dry_run)
+    # Step 2: Submit all batch jobs (Slurm queues them).
+    run_cmd_cmd = [
+        "bp",
+        "batch",
+        "run",
+        "-b",
+        split_path.as_posix(),
+        "--submit-delay",
+        str(args.submit_delay),
+    ]
+    if args.throttle:
+        run_cmd_cmd.extend(
+            [
+                "--throttle",
+                "--max-concurrent",
+                str(args.max_concurrent),
+                "--max-queue-depth",
+                str(args.max_queue_depth),
+                "--poll-interval",
+                str(args.submit_poll_seconds),
+            ]
+        )
+    run_cmd(run_cmd_cmd, dry_run=args.dry_run)
 
     # Step 3: Wait until this run's batch jobs are out of queue.
     expected_initial_ids = list(range(nbatches))

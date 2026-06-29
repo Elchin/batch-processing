@@ -5,11 +5,12 @@ import random
 import re
 import string
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 from subprocess import CompletedProcess
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -535,6 +536,167 @@ def write_json_file(path: str, content: dict, indent: int = 4) -> None:
         json.dump(content, file, indent=indent)
 
 
+RUN_MASK_VAR = "run"
+RUN_STATUS_VAR = "run_status"
+RUN_SUCCESS_VALUE = 100
+RUN_ENABLED_VALUE = 1
+SLURM_ACTIVE_STATES = frozenset({"RUNNING", "CONFIGURING", "COMPLETING", "CG"})
+
+
+@dataclass
+class BatchSubmitOptions:
+    """Controls Slurm submission for batch runs."""
+
+    submit_all: bool = True
+    max_concurrent: int = 16
+    max_queue_depth: Optional[int] = 32
+    submit_delay_seconds: float = 0.25
+    poll_interval_seconds: int = 30
+    skip_complete: bool = False
+    dry_run: bool = False
+
+
+def count_user_slurm_jobs(*, active_only: bool = True) -> int:
+    """Return the number of jobs in the current user's Slurm queue."""
+    user = os.getenv("USER")
+    if not user:
+        return 0
+
+    result = subprocess.run(
+        ["squeue", "-h", "-u", user, "-o", "%T"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return 0
+
+    states = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not active_only:
+        return len(states)
+    return sum(1 for state in states if state in SLURM_ACTIVE_STATES)
+
+
+def wait_for_submit_capacity(
+    max_concurrent: int,
+    max_queue_depth: Optional[int],
+    poll_interval_seconds: int,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Block until there is room to submit another job.
+
+    Limits concurrently *running* jobs (Lustre/MPI startup load) and optionally
+    total queue depth (RUNNING + PENDING) so all jobs can be submitted without
+    waiting for long-running simulations to finish.
+    """
+    if dry_run:
+        return
+
+    while True:
+        running = count_user_slurm_jobs(active_only=True)
+        queued = count_user_slurm_jobs(active_only=False)
+        over_running = max_concurrent > 0 and running >= max_concurrent
+        over_queue = max_queue_depth is not None and queued >= max_queue_depth
+        if not over_running and not over_queue:
+            return
+
+        reasons = []
+        if over_running:
+            reasons.append(f"running={running}/{max_concurrent}")
+        if over_queue:
+            reasons.append(f"queued={queued}/{max_queue_depth}")
+        print(
+            f"[SUBMIT] At capacity ({', '.join(reasons)}); "
+            f"waiting {poll_interval_seconds}s before next sbatch..."
+        )
+        time.sleep(poll_interval_seconds)
+
+
+def wait_for_queue_capacity(
+    max_concurrent: int,
+    poll_interval_seconds: int,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Block until active job count is below max_concurrent."""
+    wait_for_submit_capacity(
+        max_concurrent,
+        max_queue_depth=None,
+        poll_interval_seconds=poll_interval_seconds,
+        dry_run=dry_run,
+    )
+
+
+def wait_for_job_ids(
+    job_ids: Sequence[str],
+    poll_interval_seconds: int,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Wait until the given Slurm job ids are no longer in the queue."""
+    remaining = {job_id for job_id in job_ids if job_id}
+    if not remaining or dry_run:
+        return
+
+    while remaining:
+        result = subprocess.run(
+            ["squeue", "-h", "-j", ",".join(sorted(remaining)), "-o", "%A"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            print(f"[WARN] squeue check failed: {result.stderr.strip()}")
+            return
+
+        still_active = {
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        }
+        remaining &= still_active
+        if remaining:
+            print(
+                f"[SUBMIT] Waiting for {len(remaining)} job(s) to finish; "
+                f"next check in {poll_interval_seconds}s..."
+            )
+            time.sleep(poll_interval_seconds)
+
+
+def is_batch_complete(batch_dir: Path) -> bool:
+    """True when all active cells in run-mask have run_status == 100."""
+    run_mask_path = batch_dir / "input" / "run-mask.nc"
+    run_status_path = batch_dir / "output" / "run_status.nc"
+    if not run_mask_path.is_file() or not run_status_path.is_file():
+        return False
+    if run_status_path.stat().st_size == 0:
+        return False
+
+    try:
+        with xr.open_dataset(run_mask_path, decode_times=False) as ds:
+            if RUN_MASK_VAR not in ds:
+                return False
+            run_values = np.asarray(ds[RUN_MASK_VAR].values)
+        active = int(
+            np.sum(np.isfinite(run_values) & np.isclose(run_values, RUN_ENABLED_VALUE))
+        )
+        if active == 0:
+            return True
+
+        with xr.open_dataset(run_status_path, decode_times=False) as ds:
+            if RUN_STATUS_VAR not in ds:
+                return False
+            status_values = np.asarray(ds[RUN_STATUS_VAR].values)
+        completed = int(
+            np.sum(
+                np.isfinite(status_values)
+                & np.isclose(status_values, RUN_SUCCESS_VALUE)
+            )
+        )
+        return completed >= active
+    except (OSError, ValueError, KeyError):
+        return False
+
+
 def submit_job(path: str) -> CompletedProcess:
     """Submits a job script to the Slurm workload manager using the `sbatch` command.
 
@@ -550,8 +712,90 @@ def submit_job(path: str) -> CompletedProcess:
         FileNotFoundError: If the specified job script file does not exist.
         subprocess.CalledProcessError: If the `sbatch` command fails.
     """
-    command = ["sbatch", path]
+    batch_dir = os.path.dirname(path)
+    command = ["sbatch", f"--chdir={batch_dir}", path]
     return subprocess.run(command, text=True, capture_output=True)
+
+
+def submit_batch_jobs(
+    script_paths: Iterable[Union[str, Path]],
+    options: Optional[BatchSubmitOptions] = None,
+) -> Tuple[int, int, int]:
+    """Submit batch slurm_runner scripts.
+
+    By default (submit_all=True) every job is sbatch'd immediately so Slurm can
+    queue them. Set submit_all=False to pause submission while the queue is full.
+
+    Returns:
+        Tuple of (submitted_count, failed_count, skipped_count).
+    """
+    opts = options or BatchSubmitOptions()
+    paths = sorted(Path(path) for path in script_paths)
+    if not paths:
+        print("[SUBMIT] No slurm_runner scripts to submit.")
+        return 0, 0, 0
+
+    mode = "submit-all" if opts.submit_all else "throttle"
+    print(
+        f"[SUBMIT] mode={mode}, jobs={len(paths)}, "
+        f"skip_complete={opts.skip_complete}"
+    )
+    if not opts.submit_all:
+        print(
+            f"[SUBMIT] throttle limits: max_concurrent={opts.max_concurrent}, "
+            f"max_queue_depth={opts.max_queue_depth}"
+        )
+
+    submitted = 0
+    failed = 0
+    skipped = 0
+    start_time = time.time()
+
+    for index, script_path in enumerate(paths, start=1):
+        batch_dir = script_path.parent
+        if opts.skip_complete and is_batch_complete(batch_dir):
+            skipped += 1
+            continue
+
+        if opts.dry_run:
+            print(f"[SUBMIT] dry-run sbatch {script_path}")
+            submitted += 1
+            continue
+
+        if not opts.submit_all:
+            wait_for_submit_capacity(
+                opts.max_concurrent,
+                opts.max_queue_depth,
+                opts.poll_interval_seconds,
+                dry_run=opts.dry_run,
+            )
+
+        result = submit_job(script_path.as_posix())
+        if result.returncode != 0:
+            failed += 1
+            message = (result.stderr or result.stdout or "").strip()
+            print(f"[ERROR] sbatch failed for {script_path}: {message}")
+            continue
+
+        submitted += 1
+        job_id = extract_sbatch_job_id((result.stdout or "") + "\n" + (result.stderr or ""))
+        if job_id:
+            print(f"[SUBMIT] ({index}/{len(paths)}) {script_path.parent.name} -> job {job_id}")
+        else:
+            print(
+                f"[SUBMIT] ({index}/{len(paths)}) {script_path.parent.name}: "
+                f"{(result.stdout or '').strip()}"
+            )
+
+        if opts.submit_delay_seconds > 0:
+            time.sleep(opts.submit_delay_seconds)
+
+    elapsed = time.time() - start_time
+    print(
+        f"[SUBMIT] Done in {elapsed:.1f}s: submitted={submitted}, "
+        f"failed={failed}, skipped={skipped}"
+    )
+    return submitted, failed, skipped
 
 
 def extract_sbatch_job_id(output: str) -> Optional[str]:
