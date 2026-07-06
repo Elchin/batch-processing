@@ -43,6 +43,13 @@ export PMIX_MCA_pcompress_base_silence_warning=1
 # Lustre: disable HDF5 file locking (incompatible with Lustre without flock)
 export HDF5_USE_FILE_LOCKING=FALSE
 
+# Pin the parallel (MPI-enabled) NetCDF the dvmdostem binary was linked against.
+# The binary uses RUNPATH, which is searched AFTER LD_LIBRARY_PATH; the deps
+# module puts a non-parallel NetCDF on LD_LIBRARY_PATH. Prepending the parallel
+# build guarantees nc_create_par/nc_open_par work (avoids the
+# "Parallel operation on file opened for non-parallel access" crash).
+export LD_LIBRARY_PATH=/mnt/exacloud/cchang_woodwellclimate_org/software/netcdf-c/4.9.2/lib:$${LD_LIBRARY_PATH:-}
+
 # OpenMPI 4.1.x: use ROMIO instead of buggy OMPIO for NetCDF/HDF5 parallel I/O.
 # Default: --use-hwthread-cpus. Pass --mpi-ranks N to wiemip_split/split for mpirun -n N.
 mpirun $mpirun_rank_flags \

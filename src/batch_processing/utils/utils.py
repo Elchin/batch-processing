@@ -429,10 +429,16 @@ def mpirun_rank_flags(mpi_ranks: int | None) -> str:
 
     Default (mpi_ranks is None): one rank per hardware thread.
     Explicit mpi_ranks: fixed ``mpirun -n N``.
+
+    ``--use-hwthread-cpus`` is always included so OpenMPI sizes the slot pool
+    from the node's CPUs rather than the Slurm task count. Without it, a job
+    with ``-N 1`` and no ``--ntasks``/``--cpus-per-task`` exposes a single slot
+    and ``mpirun -n N`` aborts with "not enough slots". Compute nodes are
+    ThreadsPerCore=1, so hwthreads map 1:1 to physical cores.
     """
     if mpi_ranks is None:
         return "--use-hwthread-cpus"
-    return f"-n {max(1, int(mpi_ranks))}"
+    return f"-n {max(1, int(mpi_ranks))} --use-hwthread-cpus"
 
 
 def render_slurm_job_script(template_name: str, values: dict) -> str:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import xarray as xr
@@ -13,6 +13,9 @@ COL_DIM_CANDIDATES = ("X", "x", "longitude", "lon")
 RUN_MASK_VARIABLE = "run"
 RUN_ENABLED_VALUE = 1
 SPLIT_METADATA_FILENAME = "wiemip_split_metadata.json"
+BATCH_LAYOUT_FILENAME = "batch_layout.json"
+SPLIT_MODE_Y_STRIPE = "y-stripe"
+SPLIT_MODE_RECT = "rect"
 
 
 @dataclass(frozen=True)
@@ -44,9 +47,11 @@ class WiemipSplitMetadata:
     full_cols: int
     active_bbox: dict[str, int]
     file_mappings: dict[str, str]
+    split_mode: str = SPLIT_MODE_Y_STRIPE
+    blocks: Optional[List[List[int]]] = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "original_input_path": self.original_input_path,
             "filtered_staging_path": self.filtered_staging_path,
@@ -58,10 +63,18 @@ class WiemipSplitMetadata:
             "full_cols": self.full_cols,
             "active_bbox": self.active_bbox,
             "file_mappings": self.file_mappings,
+            "split_mode": self.split_mode,
         }
+        if self.blocks is not None:
+            payload["blocks"] = self.blocks
+        return payload
 
     @classmethod
     def from_dict(cls, payload: dict) -> "WiemipSplitMetadata":
+        blocks_raw = payload.get("blocks")
+        blocks: Optional[List[List[int]]] = None
+        if blocks_raw is not None:
+            blocks = [[int(v) for v in block] for block in blocks_raw]
         return cls(
             schema_version=int(payload.get("schema_version", 1)),
             original_input_path=str(payload["original_input_path"]),
@@ -74,6 +87,8 @@ class WiemipSplitMetadata:
             full_cols=int(payload["full_cols"]),
             active_bbox=dict(payload["active_bbox"]),
             file_mappings=dict(payload.get("file_mappings", {})),
+            split_mode=str(payload.get("split_mode", SPLIT_MODE_Y_STRIPE)),
+            blocks=blocks,
         )
 
     @property
@@ -84,6 +99,28 @@ class WiemipSplitMetadata:
             col_start=int(self.active_bbox["col_start"]),
             col_end=int(self.active_bbox["col_end"]),
         )
+
+    @property
+    def uses_rect_split(self) -> bool:
+        return self.split_mode == SPLIT_MODE_RECT
+
+
+def write_batch_layout(path: Path, *, blocks: List[Tuple[int, int, int, int]], grid_y: int, grid_x: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "blocks": [list(block) for block in blocks],
+        "Y": int(grid_y),
+        "X": int(grid_x),
+    }
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=2)
+
+
+def read_batch_layout(path: Path) -> Tuple[List[Tuple[int, int, int, int]], int, int]:
+    with open(path, "r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    blocks = [tuple(int(v) for v in block) for block in payload["blocks"]]
+    return blocks, int(payload["Y"]), int(payload["X"])
 
 
 def write_split_metadata(path: Path, metadata: WiemipSplitMetadata) -> None:

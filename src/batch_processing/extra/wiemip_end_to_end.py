@@ -44,6 +44,11 @@ DEFAULT_PLOT_SCRIPT = os.path.expanduser(
     "~/Circumpolar_TEM_aux_scripts/plot_nc_all_files.py"
 )
 DEFAULT_SPLIT_PARTITION = ""
+DEFAULT_SPLIT_MODE = "rect"
+DEFAULT_CELLS_PER_BATCH = 200
+DEFAULT_MPI_RANKS = 8
+DEFAULT_MIN_CELLS_PER_BATCH = 16
+DEFAULT_RERUN_PARTITION = "compute"
 RUN_MASK_VAR = "run"
 
 
@@ -360,9 +365,9 @@ def _validate_option2_restart(
     source_count = len(source_batch_dirs)
     if source_count != nbatches:
         raise ValueError(
-            f"--restart_from has {source_count} batch directories but --input run-mask "
-            f"implies nbatches={nbatches}. Use the same setup and batch geometry for both, "
-            f"or pick a matching source split."
+            f"--restart_from has {source_count} batch directories but the split at "
+            f"--split has {nbatches}. For Option 2, use the same --cells-per-batch, "
+            "CMT filters, and input setup so batch geometry matches the source split."
         )
 
     if _is_staging_input_path(input_path):
@@ -399,6 +404,7 @@ def run_rerun_pass(
     pass_index: int,
     poll_seconds: int,
     dry_run: bool,
+    rerun_partition: str = DEFAULT_RERUN_PARTITION,
     initial_grace_seconds: int = 120,
 ) -> None:
     if not batch_ids:
@@ -417,7 +423,17 @@ def run_rerun_pass(
                 before_counts[batch_id] = 0
         else:
             before_counts[batch_id] = 0
-        run_cmd(["bp", "batch", "wiemip_re-run", batch_path.as_posix()], dry_run=dry_run)
+        run_cmd(
+            [
+                "bp",
+                "batch",
+                "wiemip_re-run",
+                batch_path.as_posix(),
+                "--partition",
+                rerun_partition,
+            ],
+            dry_run=dry_run,
+        )
 
     wait_for_jobs(
         split_path=split_path,
@@ -535,8 +551,61 @@ def main() -> None:
         "--slurm-partition",
         default=DEFAULT_SPLIT_PARTITION,
         help=(
-            "Optional split partition/node type for `bp batch wiemip_split` "
+            "Slurm partition for `bp batch wiemip_split` and initial `bp batch run` "
             "(examples: dask, spot, compute)."
+        ),
+    )
+    parser.add_argument(
+        "--split-mode",
+        default=DEFAULT_SPLIT_MODE,
+        choices=("y-stripe", "rect"),
+        help=(
+            "WIEMIP split geometry for `bp batch wiemip_split`: "
+            f"'rect' (default, 2D active-cell blocks) or 'y-stripe' (legacy latitude stripes)."
+        ),
+    )
+    parser.add_argument(
+        "--cells-per-batch",
+        type=int,
+        default=DEFAULT_CELLS_PER_BATCH,
+        help=(
+            "Target active cells per batch for `bp batch wiemip_split` "
+            f"(default: {DEFAULT_CELLS_PER_BATCH}). Use `bp batch suggest-split` "
+            "to tune this for your setup."
+        ),
+    )
+    parser.add_argument(
+        "--min-cells-per-batch",
+        type=int,
+        default=DEFAULT_MIN_CELLS_PER_BATCH,
+        help=(
+            "Rect split only: minimum active cells per batch after block merging "
+            f"(default: {DEFAULT_MIN_CELLS_PER_BATCH}; use ~2x --mpi-ranks)."
+        ),
+    )
+    parser.add_argument(
+        "--mpi-ranks",
+        type=int,
+        default=DEFAULT_MPI_RANKS,
+        help=(
+            "MPI ranks per batch job written into slurm_runner.sh during split "
+            f"(default: {DEFAULT_MPI_RANKS})."
+        ),
+    )
+    parser.add_argument(
+        "--rerun-partition",
+        default=DEFAULT_RERUN_PARTITION,
+        help=(
+            "Slurm partition for `bp batch wiemip_re-run` recovery jobs "
+            f"(default: {DEFAULT_RERUN_PARTITION}). Avoid dask when mpi-ranks > 4."
+        ),
+    )
+    parser.add_argument(
+        "--skip-split",
+        action="store_true",
+        help=(
+            "Skip `bp batch wiemip_split` and reuse an existing split directory "
+            "at --split (for recovery or re-submit only)."
         ),
     )
     parser.add_argument(
@@ -612,7 +681,7 @@ def main() -> None:
         metavar="N",
         help=(
             "WIEMIP split: disable active cells where veg_class > N in vegetation.nc "
-            "(runs after climate and --cmt0-filter prefilters). Default N is 74."
+            "(applied before split when enabled). Default N is 74."
         ),
     )
     parser.add_argument(
@@ -661,54 +730,92 @@ def main() -> None:
         raise ValueError("--submit-delay must be >= 0")
     if args.initial_grace_seconds < 0:
         raise ValueError("--initial-grace-seconds must be >= 0")
+    if args.cells_per_batch < 1:
+        raise ValueError("--cells-per-batch must be >= 1")
+    if args.min_cells_per_batch < 1:
+        raise ValueError("--min-cells-per-batch must be >= 1")
+    if args.mpi_ranks < 1:
+        raise ValueError("--mpi-ranks must be >= 1")
+    if args.split_mode == "y-stripe" and args.min_cells_per_batch != DEFAULT_MIN_CELLS_PER_BATCH:
+        print(
+            "[WARN] --min-cells-per-batch applies to rect split only; "
+            "ignored for y-stripe."
+        )
     restart_from_path: Path | None = None
     if args.restart_from:
         restart_from_path = normalize_path(args.restart_from)
         if not restart_from_path.exists():
             raise FileNotFoundError(f"--restart_from path does not exist: {restart_from_path}")
+        if args.split_mode == "rect":
+            print(
+                "[WARN] Option 2 restart seeding assumes matching batch layout between "
+                "splits. Rect vs y-stripe (or different --cells-per-batch) layouts are "
+                "not batch-compatible; verify restart files spatially before production."
+            )
 
     print(f"[INFO] Input path: {input_path}")
     print(f"[INFO] Split path: {split_path}")
 
-    # Step 1: Standard batch split.
-    split_cmd = [
-        "bp",
-        "batch",
-        "split",
-        "-i",
-        input_path.as_posix(),
-        "-b",
-        split_path.as_posix(),
-        "--cells-per-batch",
-        "160",
-        "--mpi-ranks",
-        "8",
-        "--restart_from",
-        "",
-        "-p",
-        str(args.p),
-        "-e",
-        str(args.e),
-        "-s",
-        str(args.s),
-        "-t",
-        str(args.t),
-    ]
-    if args.slurm_partition:
-        split_cmd.extend(["-sp", args.slurm_partition])
-    if args.cmt0_filter:
-        split_cmd.append("--cmt0-filter")
-    if args.no_max_cmt:
-        split_cmd.append("--no-max-cmt")
+    # Step 1: WIEMIP integrated filter + active-cell-balanced split.
+    if not args.skip_split:
+        split_cmd = [
+            "bp",
+            "batch",
+            "wiemip_split",
+            "-i",
+            input_path.as_posix(),
+            "-b",
+            split_path.as_posix(),
+            "--split-mode",
+            args.split_mode,
+            "--cells-per-batch",
+            str(args.cells_per_batch),
+            "--mpi-ranks",
+            str(args.mpi_ranks),
+            "--restart_from",
+            "",
+            "-p",
+            str(args.p),
+            "-e",
+            str(args.e),
+            "-s",
+            str(args.s),
+            "-t",
+            str(args.t),
+        ]
+        if args.split_mode == "rect":
+            split_cmd.extend(
+                [
+                    "--min-cells-per-batch",
+                    str(args.min_cells_per_batch),
+                ]
+            )
+        if args.slurm_partition:
+            split_cmd.extend(["-sp", args.slurm_partition])
+        if args.runmask_prefilter:
+            split_cmd.append("--runmask-prefilter")
+        else:
+            split_cmd.append("--no-runmask-prefilter")
+        if args.cmt0_filter:
+            split_cmd.append("--cmt0-filter")
+        if args.no_max_cmt:
+            split_cmd.append("--no-max-cmt")
+        else:
+            split_cmd.extend(["--max-cmt", str(args.max_cmt)])
+        run_cmd(split_cmd, dry_run=args.dry_run)
     else:
-        split_cmd.extend(["--max-cmt", str(args.max_cmt)])
-    run_cmd(split_cmd, dry_run=args.dry_run)
+        print("[STEP 1] Skipping split (--skip-split); using existing batches under split path.")
 
-    # Step 1.1: Determine nbatches dynamically after the split is done.
+    # Step 1.1: Determine batch count after split (or from existing split dir).
     batch_dirs = get_batch_dirs(split_path)
     nbatches = len(batch_dirs)
-    max_batch_id = nbatches - 1 if nbatches > 0 else 0
-    print(f"[INFO] Split produced {nbatches} batches (max batch id: {max_batch_id}).")
+    if nbatches <= 0:
+        raise FileNotFoundError(
+            f"No batch_* directories found under split path: {split_path}. "
+            "Run without --skip-split or check --split."
+        )
+    max_batch_id = nbatches - 1
+    print(f"[INFO] Split has {nbatches} batches (max batch id: {max_batch_id}).")
 
     if restart_from_path is not None:
         _validate_option2_restart(
@@ -818,18 +925,18 @@ def main() -> None:
             "[STEP 4] Incomplete batches found: "
             + format_incomplete_progress(incomplete_ids, progress)
         )
+        # Steps 5-8: first rerun pass.
+        run_rerun_pass(
+            split_path=split_path,
+            batch_ids=incomplete_ids,
+            pass_index=1,
+            poll_seconds=args.poll_seconds,
+            dry_run=args.dry_run,
+            rerun_partition=args.rerun_partition,
+            initial_grace_seconds=args.initial_grace_seconds,
+        )
     else:
         print("[STEP 4] No incomplete batches after initial run.")
-
-    # Steps 5-8: first rerun pass.
-    run_rerun_pass(
-        split_path=split_path,
-        batch_ids=incomplete_ids,
-        pass_index=1,
-        poll_seconds=args.poll_seconds,
-        dry_run=args.dry_run,
-        initial_grace_seconds=args.initial_grace_seconds,
-    )
 
     # Step 9: optional second rerun pass.
     incomplete_after_pass1, progress_after_pass1 = collect_incomplete_batches(split_path)
@@ -844,6 +951,7 @@ def main() -> None:
             pass_index=2,
             poll_seconds=args.poll_seconds,
             dry_run=args.dry_run,
+            rerun_partition=args.rerun_partition,
             initial_grace_seconds=args.initial_grace_seconds,
         )
     else:
@@ -858,11 +966,11 @@ def main() -> None:
     else:
         print("[INFO] All batches complete after rerun passes.")
 
-    # Step 10: final standard merge.
-    run_cmd(["bp", "batch", "merge", "-b", split_path.as_posix()], dry_run=False)
+    # Step 10: final WIEMIP merge (Y-stripe batches from wiemip_split).
+    run_cmd(["bp", "batch", "wiemip_merge", "-b", split_path.as_posix()], dry_run=False)
 
     # Step 11: plot merged outputs.
-    merged_restored = split_path / "all_merged"
+    merged_restored = split_path / "wiemip_merged" / "merged_restored"
     if not merged_restored.exists():
         raise FileNotFoundError(f"Merged output directory not found: {merged_restored}")
     if not plot_script.exists():

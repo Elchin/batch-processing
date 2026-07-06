@@ -267,6 +267,13 @@ def slice_input(
 # Update the command definitions to include the common parameters directly
 # This is a better approach than trying to add parameters after command definition
 
+_CELLS_PER_BATCH_HELP = (
+    "Target number of active cells per batch after run-mask filters. "
+    "For wiemip_split: y-stripe mode uses full-width latitude stripes; "
+    "rect mode balances active cells in 2D blocks (see --split-mode)."
+)
+
+
 # For batch split command
 @batch_app.command("split")
 def batch_split(
@@ -304,7 +311,7 @@ def batch_split(
     cells_per_batch: Optional[int] = typer.Option(
         None,
         "--cells-per-batch",
-        help="Maximum number of grid cells per batch. If provided, partitions across both X and Y dimensions."
+        help=_CELLS_PER_BATCH_HELP,
     ),
     p: int = typer.Option(0, help="Number of PRE RUN years to run. By default, 0"),
     e: int = typer.Option(0, help="Number of EQUILIBRIUM years to run. By default, 0"),
@@ -525,11 +532,18 @@ def batch_wiemip_split(
             "with /mnt/exacloud/$USER"
         ),
     ),
-    nbatches: int = typer.Option(
-        ...,
+    nbatches: Optional[int] = typer.Option(
+        None,
         "--nbatches",
         "-N",
-        help="Number of Y-stripe batches to create.",
+        help=(
+            "Number of equal-row Y-stripe batches. Omit when using --cells-per-batch."
+        ),
+    ),
+    cells_per_batch: Optional[int] = typer.Option(
+        None,
+        "--cells-per-batch",
+        help=_CELLS_PER_BATCH_HELP,
     ),
     launch_as_job: bool = typer.Option(
         False,
@@ -588,7 +602,7 @@ def batch_wiemip_split(
         False,
         "--cmt0-filter/--no-cmt0-filter",
         help=(
-            "After split, disable run-mask cells where vegetation.nc veg_class==0 "
+            "Before split, disable run-mask cells where vegetation.nc veg_class==0 "
             "(CMT 0). Off by default."
         ),
     ),
@@ -597,7 +611,7 @@ def batch_wiemip_split(
         "--max-cmt",
         metavar="N",
         help=(
-            "After split, disable run-mask cells where vegetation.nc veg_class > N. "
+            "Before split, disable run-mask cells where vegetation.nc veg_class > N. "
             f"Default threshold is {_DEFAULT_MAX_CMT}; omit this flag to use that default."
         ),
     ),
@@ -609,13 +623,30 @@ def batch_wiemip_split(
             "By default the prefilter runs with the --max-cmt threshold."
         ),
     ),
+    split_mode: str = typer.Option(
+        "y-stripe",
+        "--split-mode",
+        help=(
+            "WIEMIP split geometry: 'y-stripe' (default, legacy full-width latitude "
+            "stripes) or 'rect' (2D blocks balanced by active cells; requires canvas "
+            "merge and writes batch_layout.json)."
+        ),
+    ),
+    min_cells_per_batch: int = typer.Option(
+        1,
+        "--min-cells-per-batch",
+        help=(
+            "Rect split only: merge trailing tiny blocks until each batch has at least "
+            "this many active cells (use ~2x --mpi-ranks to avoid idle MPI ranks)."
+        ),
+    ),
 ):
     """
     Split WIEMIP setup NetCDF files via integrated filter+split.
 
     The command computes active-cell bbox from run-mask, creates an internal filtered
     staging dataset (cropped 2D, inactive masked), writes split metadata, and then
-    creates Y-stripe batch inputs for dvmdostem.
+    creates batch inputs for dvmdostem using y-stripe or rect blocks.
     """
     _require_max_cmt_argv_has_int()
     all_args = {
@@ -623,6 +654,7 @@ def batch_wiemip_split(
         "input_path": input_path,
         "batches": batches,
         "nbatches": nbatches,
+        "cells_per_batch": cells_per_batch,
         "launch_as_job": launch_as_job,
         "p": p,
         "e": e,
@@ -639,6 +671,8 @@ def batch_wiemip_split(
         "cmt0_filter": cmt0_filter,
         "max_cmt": max_cmt,
         "no_max_cmt": no_max_cmt,
+        "split_mode": split_mode,
+        "min_cells_per_batch": min_cells_per_batch,
     }
     args = type("Args", (), all_args)()
     WiemipSplitCommand(args).execute()

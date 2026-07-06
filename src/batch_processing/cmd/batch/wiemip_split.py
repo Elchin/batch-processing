@@ -11,11 +11,22 @@ import numpy as np
 import xarray as xr
 
 from batch_processing.cmd.batch.split import BatchSplitCommand
+from batch_processing.utils.split_planning import (
+    apply_run_mask_filters,
+    count_active_cells,
+    plan_rect_blocks_by_active_cells,
+    plan_y_ranges_by_active_cells,
+    plan_y_stripe_blocks_by_active_cells,
+    summarize_active_cells_per_block,
+)
 from batch_processing.utils.utils import create_chunks, interpret_path
 from batch_processing.utils.wiemip_processing import (
     RUN_ENABLED_VALUE,
     RUN_MASK_VARIABLE,
     SPLIT_METADATA_FILENAME,
+    SPLIT_MODE_RECT,
+    SPLIT_MODE_Y_STRIPE,
+    BATCH_LAYOUT_FILENAME,
     ActiveBBox,
     WiemipSplitMetadata,
     compute_active_bbox,
@@ -23,6 +34,7 @@ from batch_processing.utils.wiemip_processing import (
     extract_run_mask_2d,
     filter_dataset_to_cropped_mask,
     open_dataset_for_read,
+    write_batch_layout,
     write_split_metadata,
 )
 
@@ -159,8 +171,21 @@ class WiemipSplitCommand(BatchSplitCommand):
             print(f"[staging {file_index}/{len(source_files)}] {src.name} -> {dst_name}")
 
             if dst_name == RUN_MASK_DESTINATION:
-                print("  [copy] run-mask passthrough")
-                shutil.copy2(src, dst_path)
+                print("  [filter] cropping CMT-filtered run-mask to active bbox")
+                cropped_da = run_mask_da.isel(
+                    {
+                        run_row_dim: slice(bbox.row_start, bbox.row_end + 1),
+                        run_col_dim: slice(bbox.col_start, bbox.col_end + 1),
+                    }
+                )
+                out_ds = xr.Dataset({RUN_MASK_VARIABLE: cropped_da})
+                out_ds.to_netcdf(
+                    dst_path.as_posix(),
+                    engine="netcdf4",
+                    format=OUTPUT_NETCDF_FORMAT,
+                )
+                out_ds.close()
+                print(f"  [write] {dst_path}")
                 continue
 
             with open_dataset_for_read(src) as ds:
@@ -194,7 +219,7 @@ class WiemipSplitCommand(BatchSplitCommand):
                 print(f"  [write] {dst_path}")
         return file_mappings
 
-    def _split_spatial_file_to_y_stripes(
+    def _split_spatial_file_to_blocks(
         self,
         src_file: Path,
         destination_name: str,
@@ -202,11 +227,11 @@ class WiemipSplitCommand(BatchSplitCommand):
         col_dim: str,
         is_full_grid: bool,
         bbox: Tuple[int, int, int, int],
-        y_ranges: List[Tuple[int, int]],
+        blocks: List[Tuple[int, int, int, int]],
         batch_input_dirs: List[Path],
     ) -> None:
         row_min, row_max, col_min, col_max = bbox
-        print(f"Splitting {src_file.name} -> {destination_name} (Y stripes)")
+        print(f"Splitting {src_file.name} -> {destination_name} ({len(blocks)} blocks)")
         with open_dataset_for_read(src_file) as ds:
             if is_full_grid:
                 base_ds = ds.isel(
@@ -220,10 +245,16 @@ class WiemipSplitCommand(BatchSplitCommand):
 
             total_batches = len(batch_input_dirs)
             progress_every = max(1, total_batches // 10)
-            for batch_index, ((start, end), batch_input_dir) in enumerate(
-                zip(y_ranges, batch_input_dirs), start=1
+            for batch_index, (block, batch_input_dir) in enumerate(
+                zip(blocks, batch_input_dirs), start=1
             ):
-                subset_ds = base_ds.isel({row_dim: slice(start, end)}).load()
+                start_row, end_row, start_col, end_col = block
+                subset_ds = base_ds.isel(
+                    {
+                        row_dim: slice(start_row, end_row),
+                        col_dim: slice(start_col, end_col),
+                    }
+                ).load()
                 if destination_name == RUN_MASK_DESTINATION and RUN_MASK_VARIABLE in subset_ds:
                     run_values = np.asarray(subset_ds[RUN_MASK_VARIABLE].values)
                     normalized_values = np.where(
@@ -260,7 +291,8 @@ class WiemipSplitCommand(BatchSplitCommand):
                 ):
                     print(
                         f"  [split-progress] {destination_name}: "
-                        f"batch {batch_index}/{total_batches} rows {start}:{end - 1}"
+                        f"batch {batch_index}/{total_batches} "
+                        f"rows {start_row}:{end_row - 1} cols {start_col}:{end_col - 1}"
                     )
 
     def _validate_split_run_mask(
@@ -671,6 +703,47 @@ class WiemipSplitCommand(BatchSplitCommand):
             f"(veg_class > {max_cmt})."
         )
 
+    def _load_staged_run_mask_array(self, staging_path: Path) -> np.ndarray:
+        staged_run_mask = staging_path / RUN_MASK_DESTINATION
+        with open_dataset_for_read(staged_run_mask) as ds:
+            run_values = np.asarray(ds[RUN_MASK_VARIABLE].values, dtype=float)
+        return np.where(np.isnan(run_values), 0, run_values)
+
+    def _apply_cmt_filters_to_full_run_mask(
+        self,
+        run_mask_da: xr.DataArray,
+        input_path: Path,
+        *,
+        cmt0_filter: bool,
+        no_max_cmt: bool,
+        max_cmt_val: int,
+    ) -> xr.DataArray:
+        run_values = np.asarray(run_mask_da.values, dtype=float)
+        run_values = np.where(np.isnan(run_values), 0, run_values)
+        active_before = count_active_cells(run_values)
+        filtered = apply_run_mask_filters(
+            run_values,
+            input_path,
+            cmt0_filter=cmt0_filter,
+            no_max_cmt=no_max_cmt,
+            max_cmt=max_cmt_val,
+        )
+        active_after = count_active_cells(filtered)
+        if active_after == 0:
+            raise ValueError(
+                "No active cells remain in run-mask after CMT filters on full grid."
+            )
+        print(
+            "[wiemip_split] Applied CMT filters on full grid before bbox/split: "
+            f"active {active_before} -> {active_after}"
+        )
+        return xr.DataArray(
+            filtered.astype(run_mask_da.dtype, copy=False),
+            dims=run_mask_da.dims,
+            coords=run_mask_da.coords,
+            attrs=run_mask_da.attrs.copy(),
+        )
+
     def execute(self) -> None:
         print("[wiemip_split] Starting integrated WIEMIP split workflow")
         slurm_partition = getattr(self._args, "slurm_partition", "spot")
@@ -696,20 +769,54 @@ class WiemipSplitCommand(BatchSplitCommand):
             raise FileNotFoundError(f"Input path does not exist: {input_path}")
         print(f"[wiemip_split] Input path: {input_path}")
 
-        nbatches = int(getattr(self._args, "nbatches", 0))
-        if nbatches < 1:
+        nbatches_arg = getattr(self._args, "nbatches", None)
+        cells_per_batch = getattr(self._args, "cells_per_batch", None)
+        if cells_per_batch is not None and int(cells_per_batch) < 1:
+            raise ValueError("cells_per_batch must be >= 1")
+        if nbatches_arg is not None and int(nbatches_arg) < 1:
             raise ValueError("nbatches must be >= 1")
-        print(f"[wiemip_split] Requested batch count: {nbatches}")
+        if cells_per_batch is None and nbatches_arg is None:
+            raise ValueError("Specify --cells-per-batch or --nbatches.")
+        if cells_per_batch is not None and nbatches_arg is not None:
+            print(
+                "[wiemip_split] Both --cells-per-batch and --nbatches were provided; "
+                "using active-cell balancing."
+            )
+        nbatches = int(nbatches_arg) if nbatches_arg is not None else 0
+        if cells_per_batch is not None:
+            print(
+                "[wiemip_split] Active cells per batch target: "
+                f"{int(cells_per_batch)}"
+            )
+        elif nbatches:
+            print(f"[wiemip_split] Requested batch count: {nbatches}")
         runmask_prefilter = bool(getattr(self._args, "runmask_prefilter", True))
+        split_mode = str(getattr(self._args, "split_mode", SPLIT_MODE_Y_STRIPE)).strip().lower()
+        if split_mode not in (SPLIT_MODE_Y_STRIPE, SPLIT_MODE_RECT):
+            raise ValueError(
+                f"Unsupported split_mode '{split_mode}'. "
+                f"Use '{SPLIT_MODE_Y_STRIPE}' or '{SPLIT_MODE_RECT}'."
+            )
+        min_cells_per_batch = int(getattr(self._args, "min_cells_per_batch", 1))
+        if min_cells_per_batch < 1:
+            raise ValueError("min_cells_per_batch must be >= 1")
         cmt0_filter = bool(getattr(self._args, "cmt0_filter", False))
         no_max_cmt = bool(getattr(self._args, "no_max_cmt", False))
         max_cmt_val = int(getattr(self._args, "max_cmt", 74))
         max_cmt = None if no_max_cmt else max_cmt_val
+        cmt_filters_before_split = cmt0_filter or (max_cmt is not None)
         print(f"[wiemip_split] Run-mask prefilter: {runmask_prefilter}")
+        print(f"[wiemip_split] Split mode: {split_mode}")
+        if split_mode == SPLIT_MODE_RECT:
+            print(
+                "[wiemip_split] Rect split min active cells per batch: "
+                f"{min_cells_per_batch}"
+            )
         print(f"[wiemip_split] CMT0 run-mask filter (veg_class==0): {cmt0_filter}")
         if max_cmt is not None:
             print(
-                f"[wiemip_split] Max-CMT run-mask filter (veg_class > {max_cmt}): True"
+                f"[wiemip_split] Max-CMT run-mask filter (veg_class > {max_cmt}): True "
+                "(applied before split when enabled)"
             )
         else:
             print(
@@ -720,7 +827,7 @@ class WiemipSplitCommand(BatchSplitCommand):
         print("[wiemip_split:1/8] Discovering run-mask source")
         _, _, run_mask_source = self._discover_inputs(input_path)
         print(f"[wiemip_split] Run-mask source: {run_mask_source}")
-        print("[wiemip_split:2/8] Loading run-mask and computing active bbox")
+        print("[wiemip_split:2/8] Loading run-mask, applying CMT filters, computing bbox")
         with open_dataset_for_read(run_mask_source) as run_mask_ds:
             run_mask_da, run_mask_row_dim, run_mask_col_dim = extract_run_mask_2d(
                 run_mask_ds, run_mask_source.name, run_var=RUN_MASK_VARIABLE
@@ -728,11 +835,20 @@ class WiemipSplitCommand(BatchSplitCommand):
             full_rows = int(run_mask_da.sizes[run_mask_row_dim])
             full_cols = int(run_mask_da.sizes[run_mask_col_dim])
 
+        if cmt_filters_before_split:
+            run_mask_da = self._apply_cmt_filters_to_full_run_mask(
+                run_mask_da,
+                input_path,
+                cmt0_filter=cmt0_filter,
+                no_max_cmt=no_max_cmt,
+                max_cmt_val=max_cmt_val,
+            )
+
         bbox = compute_active_bbox(run_mask_da, active_value=RUN_ENABLED_VALUE)
         row_min, row_max = bbox.row_start, bbox.row_end
         col_min, col_max = bbox.col_start, bbox.col_end
         bbox_rows, bbox_cols = bbox.n_rows, bbox.n_cols
-        if nbatches > bbox_rows:
+        if cells_per_batch is None and nbatches > bbox_rows:
             raise ValueError(
                 f"nbatches ({nbatches}) cannot exceed cropped Y size ({bbox_rows})."
             )
@@ -762,7 +878,7 @@ class WiemipSplitCommand(BatchSplitCommand):
         )
         print("[wiemip_split:4/8] Writing split metadata")
         metadata = WiemipSplitMetadata(
-            schema_version=1,
+            schema_version=2,
             original_input_path=input_path.resolve().as_posix(),
             filtered_staging_path=staging_path.resolve().as_posix(),
             run_mask_filename=RUN_MASK_DESTINATION,
@@ -778,14 +894,73 @@ class WiemipSplitCommand(BatchSplitCommand):
                 "col_end": col_max,
             },
             file_mappings=file_mappings,
+            split_mode=split_mode,
         )
         write_split_metadata(self.base_batch_dir / SPLIT_METADATA_FILENAME, metadata)
         print(f"Wrote split metadata: {self.base_batch_dir / SPLIT_METADATA_FILENAME}")
 
-        print("[wiemip_split:5/8] Planning Y-stripe split from staged inputs")
+        print("[wiemip_split:5/8] Planning split blocks from staged inputs")
         row_spatial_files, copy_files, _ = self._discover_inputs(staging_path)
-        chunks = create_chunks(bbox_rows, nbatches)
-        y_ranges = [(int(chunk.start), int(chunk.end)) for chunk in chunks]
+
+        cropped_run_data = self._load_staged_run_mask_array(staging_path)
+        blocks: List[Tuple[int, int, int, int]] = []
+
+        if cells_per_batch is not None:
+            target_cells = int(cells_per_batch)
+            if split_mode == SPLIT_MODE_RECT:
+                blocks = plan_rect_blocks_by_active_cells(
+                    cropped_run_data,
+                    target_cells,
+                    min_active_cells=min_cells_per_batch,
+                )
+                avg_cells, min_cells, max_cells = summarize_active_cells_per_block(
+                    blocks, cropped_run_data
+                )
+                print(
+                    "[wiemip_split] Planned "
+                    f"{len(blocks)} rect batches by "
+                    f"~{target_cells} active cells/batch "
+                    f"(avg/min/max: {avg_cells:.1f}/{min_cells}/{max_cells})"
+                )
+            else:
+                blocks = plan_y_stripe_blocks_by_active_cells(
+                    cropped_run_data, target_cells
+                )
+                avg_cells, min_cells, max_cells = summarize_active_cells_per_block(
+                    blocks, cropped_run_data
+                )
+                print(
+                    "[wiemip_split] Planned "
+                    f"{len(blocks)} Y-stripe batches by "
+                    f"~{target_cells} active cells/batch "
+                    f"(avg/min/max: {avg_cells:.1f}/{min_cells}/{max_cells})"
+                )
+            nbatches = len(blocks)
+        else:
+            chunks = create_chunks(bbox_rows, nbatches)
+            y_ranges = [(int(chunk.start), int(chunk.end)) for chunk in chunks]
+            blocks = [(y_start, y_end, 0, bbox_cols) for y_start, y_end in y_ranges]
+            if split_mode == SPLIT_MODE_RECT:
+                raise ValueError(
+                    "Rect split requires --cells-per-batch. "
+                    "Equal-row --nbatches is only supported with y-stripe split."
+                )
+            print(
+                f"[wiemip_split] Planned {nbatches} equal-row Y-stripe batches "
+                f"({bbox_rows} cropped rows)"
+            )
+
+        if split_mode == SPLIT_MODE_RECT:
+            layout_path = self.base_batch_dir / BATCH_LAYOUT_FILENAME
+            write_batch_layout(
+                layout_path,
+                blocks=blocks,
+                grid_y=bbox_rows,
+                grid_x=bbox_cols,
+            )
+            metadata.blocks = [list(block) for block in blocks]
+            write_split_metadata(self.base_batch_dir / SPLIT_METADATA_FILENAME, metadata)
+            print(f"Wrote batch layout: {layout_path}")
 
         split_specs = []
         for src_file, destination_name, row_dim, col_dim, row_size, col_size in row_spatial_files:
@@ -803,7 +978,7 @@ class WiemipSplitCommand(BatchSplitCommand):
                 (src_file, destination_name, row_dim, col_dim, is_full_grid)
             )
 
-        print(f"Found {len(split_specs)} spatial files to split into Y stripes.")
+        print(f"Found {len(split_specs)} spatial files to split into batches.")
         print(f"Found {len(copy_files)} non-spatial files to copy.")
         print(
             "Active-cell bbox on run-mask: "
@@ -840,21 +1015,22 @@ class WiemipSplitCommand(BatchSplitCommand):
             for batch_input_dir in batch_input_dirs:
                 shutil.copy2(src_file, batch_input_dir / destination_name)
 
-        print("Splitting spatial input files into Y-stripe batches")
+        print("Splitting spatial input files into batch blocks")
         for src_file, destination_name, row_dim, col_dim, is_full_grid in split_specs:
-            self._split_spatial_file_to_y_stripes(
+            self._split_spatial_file_to_blocks(
                 src_file=src_file,
                 destination_name=destination_name,
                 row_dim=row_dim,
                 col_dim=col_dim,
                 is_full_grid=is_full_grid,
                 bbox=(row_min, row_max, col_min, col_max),
-                y_ranges=y_ranges,
+                blocks=blocks,
                 batch_input_dirs=batch_input_dirs,
             )
 
         print("Validating split run-mask files")
-        for (start, end), batch_input_dir in zip(y_ranges, batch_input_dirs):
+        for block, batch_input_dir in zip(blocks, batch_input_dirs):
+            start_row, end_row, start_col, end_col = block
             run_mask_file = batch_input_dir / RUN_MASK_DESTINATION
             if not run_mask_file.exists():
                 raise FileNotFoundError(
@@ -864,14 +1040,13 @@ class WiemipSplitCommand(BatchSplitCommand):
                 run_mask_file=run_mask_file,
                 expected_row_dim=OUTPUT_ROW_DIM,
                 expected_col_dim=OUTPUT_COL_DIM,
-                expected_rows=end - start,
-                expected_cols=bbox_cols,
+                expected_rows=end_row - start_row,
+                expected_cols=end_col - start_col,
             )
 
-        num_prefilters = (
-            int(runmask_prefilter)
-            + int(cmt0_filter)
-            + int(max_cmt is not None)
+        num_prefilters = int(runmask_prefilter) + (
+            int(cmt0_filter and not cmt_filters_before_split)
+            + int(max_cmt is not None and not cmt_filters_before_split)
         )
         tail_total = 8 + num_prefilters
         step = 8
@@ -892,15 +1067,20 @@ class WiemipSplitCommand(BatchSplitCommand):
                 "--no-runmask-prefilter."
             )
 
-        if cmt0_filter:
+        if cmt0_filter and not cmt_filters_before_split:
             print(
                 f"[wiemip_split:{step}/{tail_total}] Pre-filtering split run-mask files "
                 "(disable cells where veg_class==0)"
             )
             self._prefilter_split_run_masks_cmt0(batch_input_dirs=batch_input_dirs)
             step += 1
+        elif cmt0_filter:
+            print(
+                "[wiemip_split] Skipping post-split cmt0-filter "
+                "(already applied before split)."
+            )
 
-        if max_cmt is not None:
+        if max_cmt is not None and not cmt_filters_before_split:
             print(
                 f"[wiemip_split:{step}/{tail_total}] Pre-filtering split run-mask files "
                 f"(disable cells where veg_class>{max_cmt})"
@@ -909,6 +1089,11 @@ class WiemipSplitCommand(BatchSplitCommand):
                 batch_input_dirs=batch_input_dirs, max_cmt=max_cmt
             )
             step += 1
+        elif max_cmt is not None:
+            print(
+                "[wiemip_split] Skipping post-split max-cmt filter "
+                "(already applied before split)."
+            )
 
         if num_prefilters == 0:
             setup_step = "[wiemip_split:8/8]"

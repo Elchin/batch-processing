@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import List
 
 from batch_processing.cmd.base import BaseCommand
+from batch_processing.utils.split_planning import (
+    apply_run_mask_filters,
+    count_active_cells,
+    filter_active_blocks,
+    plan_y_stripe_blocks_by_active_cells,
+    summarize_active_cells_per_block,
+)
 from batch_processing.utils.utils import (
     create_slurm_script,
     interpret_path,
@@ -173,9 +180,14 @@ class BatchSplitCommand(BaseCommand):
         cmt0_filter = getattr(self._args, "cmt0_filter", False)
         no_max_cmt = getattr(self._args, "no_max_cmt", False)
         max_cmt_val = getattr(self._args, "max_cmt", 74)
+        prefiltered_run_data = getattr(self, "_prefiltered_run_data", None)
+        apply_cmt_on_write = (
+            (cmt0_filter or not no_max_cmt)
+            and prefiltered_run_data is None
+        )
         
         veg_ds = None
-        if (cmt0_filter or not no_max_cmt) and "vegetation.nc" in files_to_split:
+        if apply_cmt_on_write and "vegetation.nc" in files_to_split:
             veg_path = input_path / "vegetation.nc"
             if veg_path.exists():
                 veg_ds = xr.open_dataset(veg_path, engine="netcdf4", decode_times=False)
@@ -206,7 +218,10 @@ class BatchSplitCommand(BaseCommand):
                     print(f"Fallback for {input_file} due to {e}")
                     ds = xr.open_dataset(src_input_path, engine="h5netcdf", chunks=chunk_dict, decode_times=False)
 
-            if input_file == "run-mask.nc" and (cmt0_filter or not no_max_cmt) and veg_ds is not None and "veg_class" in veg_ds:
+            if input_file == "run-mask.nc" and prefiltered_run_data is not None:
+                ds = ds.load()
+                ds["run"].values = prefiltered_run_data
+            elif input_file == "run-mask.nc" and apply_cmt_on_write and veg_ds is not None and "veg_class" in veg_ds:
                 ds = ds.load()
                 veg_data = veg_ds["veg_class"].values
                 import numpy as np
@@ -253,8 +268,14 @@ class BatchSplitCommand(BaseCommand):
         no_max_cmt = getattr(self._args, "no_max_cmt", False)
         max_cmt_val = getattr(self._args, "max_cmt", 74)
         
+        prefiltered_run_data = getattr(self, "_prefiltered_run_data", None)
+        apply_cmt_on_write = (
+            (cmt0_filter or not no_max_cmt)
+            and prefiltered_run_data is None
+        )
+        
         veg_ds = None
-        if (cmt0_filter or not no_max_cmt) and "vegetation.zarr" in files_to_split:
+        if apply_cmt_on_write and "vegetation.zarr" in files_to_split:
             try:
                 veg_mapping = fs.get_mapper(os.path.join(bucket_path, "vegetation.zarr"), check=True)
                 veg_ds = xr.open_zarr(veg_mapping, decode_times=False)
@@ -284,7 +305,10 @@ class BatchSplitCommand(BaseCommand):
 
             ds = ds.chunk(chunk_dict)
 
-            if input_file == "run-mask.zarr" and (cmt0_filter or not no_max_cmt) and veg_ds is not None and "veg_class" in veg_ds:
+            if input_file == "run-mask.zarr" and prefiltered_run_data is not None:
+                ds = ds.load()
+                ds["run"].values = prefiltered_run_data
+            elif input_file == "run-mask.zarr" and apply_cmt_on_write and veg_ds is not None and "veg_class" in veg_ds:
                 ds = ds.load()
                 veg_data = veg_ds["veg_class"].values
                 import numpy as np
@@ -368,37 +392,56 @@ class BatchSplitCommand(BaseCommand):
         import numpy as np
         run_data = None
         if "run" in ds:
-            run_data = ds["run"].values
+            run_data = np.asarray(ds["run"].values, dtype=float)
+            while run_data.ndim > 2:
+                run_data = run_data.take(0, axis=0)
             run_data = np.where(np.isnan(run_data), 0, run_data)
-            
+
             cmt0_filter = getattr(self._args, "cmt0_filter", False)
             no_max_cmt = getattr(self._args, "no_max_cmt", False)
             max_cmt_val = getattr(self._args, "max_cmt", 74)
-            
-            if cmt0_filter or not no_max_cmt:
-                veg_path = self.input_path / "vegetation.nc"
-                if veg_path.exists():
-                    veg_ds = xr.open_dataset(veg_path, engine="netcdf4", decode_times=False)
-                    if "veg_class" in veg_ds:
-                        veg_data = veg_ds["veg_class"].values
-                        if cmt0_filter:
-                            run_data = np.where(veg_data == 0, 0, run_data)
-                        if not no_max_cmt:
-                            run_data = np.where(veg_data > max_cmt_val, 0, run_data)
-                    veg_ds.close()
+            active_before = count_active_cells(run_data)
+            run_data = apply_run_mask_filters(
+                run_data,
+                self.input_path if not reading_remote_data else Path(self.input_path),
+                cmt0_filter=cmt0_filter,
+                no_max_cmt=no_max_cmt,
+                max_cmt=max_cmt_val,
+            )
+            active_after = count_active_cells(run_data)
+            if active_after != active_before:
+                print(
+                    f"Applied CMT filters on full grid before split: "
+                    f"active {active_before} -> {active_after}"
+                )
+            elif cmt0_filter or not no_max_cmt:
+                print(
+                    f"CMT filters enabled; active cells unchanged ({active_after})."
+                )
+            self._prefiltered_run_data = run_data
 
         cells_per_batch = getattr(self._args, "cells_per_batch", None)
         blocks = []
-        if cells_per_batch is not None and cells_per_batch > 0:
-            import math
-            cx = min(X, int(math.sqrt(cells_per_batch)))
-            cy = min(Y, max(1, cells_per_batch // cx))
-            for y_start in range(0, Y, cy):
-                y_end = min(Y, y_start + cy)
-                for x_start in range(0, X, cx):
-                    x_end = min(X, x_start + cx)
-                    blocks.append((y_start, y_end, x_start, x_end))
-            print(f"\nInitial split yielded {len(blocks)} blocks of max size {cells_per_batch}")
+
+        if cells_per_batch is not None and int(cells_per_batch) > 0:
+            if reading_remote_data:
+                raise NotImplementedError(
+                    "bp batch split --cells-per-batch currently supports "
+                    "local input paths only."
+                )
+            if run_data is None:
+                raise ValueError("run-mask.nc must contain variable 'run'")
+            blocks = plan_y_stripe_blocks_by_active_cells(
+                run_data, int(cells_per_batch)
+            )
+            avg_cells, min_cells, max_cells = summarize_active_cells_per_block(
+                blocks, run_data
+            )
+            print(
+                f"\nPlanned {len(blocks)} full-width Y-stripe batches by "
+                f"~{int(cells_per_batch)} active cells/batch "
+                f"(avg/min/max: {avg_cells:.1f}/{min_cells}/{max_cells})"
+            )
         else:
             SPLIT_DIMENSION = "Y"
             print(f"\nSplitting across {SPLIT_DIMENSION} dimension")
@@ -407,18 +450,8 @@ class BatchSplitCommand(BaseCommand):
                 blocks.append((y, y + 1, 0, X))
 
         # Filter active blocks
-        active_blocks = []
-        for b in blocks:
-            y_start, y_end, x_start, x_end = b
-            if run_data is not None:
-                # handle cases where run_data might have more than 2 dimensions (e.g. time)
-                subset = run_data[..., y_start:y_end, x_start:x_end]
-                if (subset == 1).any():
-                    active_blocks.append(b)
-            else:
-                active_blocks.append(b)
-        
-        blocks = active_blocks
+        if run_data is not None:
+            blocks = filter_active_blocks(blocks, run_data)
         DIMENSION_SIZE = len(blocks)
         print(f"Filtered to {DIMENSION_SIZE} active batches")
 
