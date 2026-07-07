@@ -162,9 +162,16 @@ class BatchSplitCommand(BaseCommand):
             "mpirun_rank_flags": mpirun_rank_flags(mpi_ranks),
         }
 
+        # Opt-in node-local scratch runner: writes model output to the compute
+        # node's local disk during the run and stages results back to shared
+        # storage on exit, avoiding NFS parallel-I/O contention across batches.
+        localscratch = getattr(self._args, "localscratch", False)
+        template_name = (
+            "slurm_runner_localscratch.sh" if localscratch else "slurm_runner.sh"
+        )
         script_path = batch_dir / "slurm_runner.sh"
         create_slurm_script(
-            script_path.as_posix(), "slurm_runner.sh", substitution_values
+            script_path.as_posix(), template_name, substitution_values
         )
 
     def _split_with_xarray_local(

@@ -640,6 +640,17 @@ def batch_wiemip_split(
             "this many active cells (use ~2x --mpi-ranks to avoid idle MPI ranks)."
         ),
     ),
+    localscratch: bool = typer.Option(
+        False,
+        "--localscratch",
+        help=(
+            "Generate slurm_runner.sh from the node-local-scratch template: each "
+            "batch writes model output to the compute node's local disk during the "
+            "run and stages results back to shared storage on exit. Avoids NFS "
+            "parallel-I/O contention when many batches run concurrently. Also syncs "
+            "run_status.nc back periodically for live progress monitoring."
+        ),
+    ),
 ):
     """
     Split WIEMIP setup NetCDF files via integrated filter+split.
@@ -673,6 +684,7 @@ def batch_wiemip_split(
         "no_max_cmt": no_max_cmt,
         "split_mode": split_mode,
         "min_cells_per_batch": min_cells_per_batch,
+        "localscratch": localscratch,
     }
     args = type("Args", (), all_args)()
     WiemipSplitCommand(args).execute()

@@ -29,6 +29,7 @@ All of the available commands are:
 * [bp init](#bp-init)
 * [bp tem](#bp-tem)
 * [bp batch split](#bp-batch-split)
+* [bp batch suggest-split](#bp-batch-suggest-split)
 * [bp batch wiemip_split](#bp-batch-wiemip_split)
 * [bp batch wiemip_merge](#bp-batch-wiemip_merge)
 * [bp batch wiemip_re-run](#bp-batch-wiemip_re-run)
@@ -51,13 +52,13 @@ It takes the following optional arguments:
 
 * `--basedir`: Parent directory where dvm-dos-tem will be installed. Optional, by default `/opt/apps`. The `dvm-dos-tem` folder will be created inside this directory. This argument is useful when working with different versions of dvm-dos-tem.
 * `--compile`: Clone dvm-dos-tem from GitHub and compile it instead of copying a pre-built version from the bucket. Optional, by default copies from bucket to save time.
+* `--branch`: Git branch of dvm-dos-tem to clone. Optional, only used together with `--compile`.
 
 ```bash
 bp init                              # Installs to /opt/apps/dvm-dos-tem
 bp init --basedir /mnt/exacloud      # Installs to /mnt/exacloud/dvm-dos-tem
 bp init --compile                    # Clones and compiles to /opt/apps/dvm-dos-tem
-bp init --basedir /mnt/exacloud --compile
-```
+bp init --basedir /mnt/exacloud --compile --branch my
 
 ### bp tem
 
@@ -76,6 +77,7 @@ It takes the following arguments:
 * `-i/--input-path`: Remote or local path to the directory that contains the input files. If remote, prefix the path with `gcs://`. Required.
 * `-b/--batches`: Path to store the split batches. Note that the given value will be concatenated with `/mnt/exacloud/$USER`. Required.
 * `-sp/--slurm-partition`: Name of the slurm partition. Optional, by default `spot`.
+* `--cells-per-batch`: Target number of active cells per batch after run-mask filters. Optional; when set, the number of batches is derived from the active-cell count instead of a fixed count.
 * `-p`: Number of pre-run years to run. Optional, by default `0`.
 * `-e`: Number of equilibrium years to run. Optional, by default `0`.
 * `-s`: Number of spin-up years to run. Optional, by default `0`.
@@ -84,9 +86,37 @@ It takes the following arguments:
 * `-l/--log-level`: Level of logging. Optional, by default `disabled`.
 * `--job-name-prefix`: Optional prefix for job names to make them unique.
 * `--restart-run`: Add `--no-output-cleanup` and `--restart-run` flags to mpirun command. Optional.
+* `-sc/--scenario-continuation`: Set `restart_from` to `output/restart-tr.nc` and add `--no-output-cleanup` before `--max-output-volume` in the slurm runner. Optional.
+* `--restart_from`/`--restart-from`: Override `IO.restart_from` in the generated `config.js` with the exact value provided (for example `--restart_from ""`). Optional.
+* `--mpi-ranks`: Explicit MPI rank count per batch job (`mpirun -n N`). Optional; if omitted, the slurm runner uses `mpirun --use-hwthread-cpus`.
+* `--cmt0-filter/--no-cmt0-filter`: Disable run-mask cells where `veg_class == 0` (CMT 0). Optional, off by default.
+* `--max-cmt N`: Disable run-mask cells where `vegetation.nc` `veg_class > N`. Optional, default threshold `74`.
+* `--no-max-cmt`: Disable the max-CMT run-mask filter (`veg_class > N`). Optional.
 
 If `bp batch split -i /mnt/exacloud/dvmdostem-input/my-big-input-dataset -b first-run -p 100 -e 1000 -s 85 -t 115 -n 85 --log-level warn` command is run, you should be able to see your batch folders in `/mnt/exacloud/$USER/first-run` where `$USER` is the username of the current logged in user.
 You can check `slurm_runner.sh` to see the details of the job.
+
+### bp batch suggest-split
+
+Estimates a reasonable split configuration for a WIEMIP setup directory without creating any batches.
+It inspects `run-mask.nc` (and optionally `vegetation.nc`) to count active cells and prints suggested `--cells-per-batch` / batch counts, optionally calibrated against a pilot batch's measured walltime.
+It takes the following arguments:
+
+* `-i/--input-path`: WIEMIP setup directory containing `run-mask.nc` (and optional `vegetation.nc`). Required.
+* `-b/--batches`: Optional split output path to include in the example commands it prints.
+* `--target-batches`: Desired number of active batches. Optional, by default `100`.
+* `--target-walltime-hours`: Optional target walltime per batch in hours. Requires `--pilot-hours` and `--pilot-batch-dir`.
+* `--pilot-batch-dir`: Completed or representative batch directory used for timing calibration. Optional.
+* `--pilot-hours`: Measured walltime in hours for the pilot batch. Optional.
+* `--pilot-cells`: Override the active-cell count for pilot timing when the pilot batch is too small. Optional.
+* `--mpi-ranks`: MPI ranks per batch job used for cells/rank guidance. Optional, by default `8`.
+* `--max-concurrent`: Concurrent jobs assumed for the experiment walltime estimate. Optional, by default `16`.
+* `-p`/`-e`/`-s`/`-t`/`-n`: Year counts used for total-years / pilot scaling. Optional, by default `0`.
+* `--cmt0-filter/--no-cmt0-filter`, `--max-cmt N`, `--no-max-cmt`: Apply the same run-mask filters used by `bp batch split` so the estimate reflects the cells that will actually run.
+
+```bash
+bp batch suggest-split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated --target-batches 100 --mpi-ranks 8
+```
 
 ### bp batch wiemip_split
 
@@ -118,6 +148,27 @@ Notes:
   in `vegetation.nc`, with **N=74** unless you pass `--max-cmt N`. Disable with
   `--no-max-cmt`.
 
+Key arguments:
+
+* `-i/--input-path`: Local path to the original WIEMIP setup inputs. Required.
+* `-b/--batches`: Path to store the split batches (concatenated with `/mnt/exacloud/$USER`). Required.
+* `-N/--nbatches`: Number of equal-row Y-stripe batches. Omit when using `--cells-per-batch`.
+* `--cells-per-batch`: Target number of active cells per batch after run-mask filters. Alternative to `-N`.
+* `--split-mode`: Split geometry, either `y-stripe` (default, full-width latitude stripes) or `rect` (2D blocks balanced by active-cell count).
+* `--min-cells-per-batch`: Rect mode only. Merge trailing tiny blocks until each batch has at least this many active cells (use roughly `2x --mpi-ranks` to avoid idle MPI ranks). Optional, by default `1`.
+* `-sp/--slurm-partition`: Name of the slurm partition. Optional, by default `spot`.
+* `--mpi-ranks`: Explicit MPI rank count per batch job (`mpirun -n N`). Optional; if omitted, the runner uses `mpirun --use-hwthread-cpus`.
+* `-p`/`-e`/`-s`/`-t`/`-n`: Pre-run / equilibrium / spin-up / transient / scenario years. Optional, by default `0`.
+* `-l/--log-level`: Level of logging. Optional, by default `disabled`.
+* `--job-name-prefix`: Optional prefix for job names.
+* `--restart-run`: Add `--no-output-cleanup` flag to the mpirun command. Optional.
+* `-sc/--scenario-continuation`: Set `restart_from` to `output/restart-tr.nc` and add `--no-output-cleanup` before `--max-output-volume` in the slurm runner. Optional.
+* `--restart_from`/`--restart-from`: Override `IO.restart_from` in the generated `config.js` with the exact value provided. Optional.
+* `--runmask-prefilter/--no-runmask-prefilter`: Climate invalid-cell prefilter. Enabled by default.
+* `--cmt0-filter/--no-cmt0-filter`: Disable cells where `veg_class == 0`. Optional, off by default.
+* `--max-cmt N` / `--no-max-cmt`: Max-CMT prefilter threshold and toggle. Default threshold `74`.
+* `--localscratch`: Generate the node-local-scratch runner (see [Node-local scratch](#node-local-scratch---localscratch) below). Optional.
+
 Example:
 
 ```bash
@@ -144,6 +195,48 @@ bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_
 bp batch wiemip_split -i /mnt/exacloud/$USER/wiemip/setup_05deg_updated -b test_split -N 100 --no-max-cmt
 ```
 
+#### Node-local scratch (`--localscratch`)
+
+On clusters with a single shared NFS server, many batches writing parallel
+NetCDF output concurrently saturate the filesystem and slow every job (observed
+~25x slowdown at ~90 concurrent batches). `--localscratch` makes each batch
+write model output to the compute node's local disk during the run, then stage
+results back to shared storage on exit. It also syncs `run_status.nc` back
+every few minutes for live progress monitoring, and derives the parallel NetCDF
+library from the binary's RUNPATH (no hardcoded paths).
+
+```bash
+# Fresh full run (pr -> eq -> sp -> tr) with node-local scratch
+bp batch wiemip_split \
+  -i /mnt/exacloud/$USER/wiemip/inputs/stable_input \
+  -b /mnt/exacloud/$USER/wiemip/EXP_spin_noFire_noWetland_v3 \
+  --split-mode rect --cells-per-batch 200 --min-cells-per-batch 16 \
+  --cmt0-filter --max-cmt 74 \
+  -sp compute --mpi-ranks 8 --localscratch \
+  -p 100 -e 2000 -s 200 -t 150 -n 0
+```
+
+Restart from a spin-up restart file (continue into the transient stage). Use
+`wiemip_end_to_end.py` Option 2 to seed each batch's `restart-sp.nc` per batch,
+and set PR/EQ/SP years to 0 (the model asserts PR/EQ years == 0 when restarting):
+
+```bash
+python src/batch_processing/extra/wiemip_end_to_end.py \
+  --input  /mnt/exacloud/$USER/wiemip/inputs/stable_input \
+  --split  /mnt/exacloud/$USER/wiemip/EXP_spin_noFire_noWetland_v3_restart \
+  --restart_from /mnt/exacloud/$USER/wiemip/EXP_spin_noFire_noWetland_v3 \
+  --restart_file restart-sp.nc \
+  --split-mode rect --cells-per-batch 200 --min-cells-per-batch 16 \
+  --cmt0-filter --max-cmt 74 \
+  -sp compute --mpi-ranks 8 --localscratch \
+  -p 0 -e 0 -s 0 -t 150 -n 0
+```
+
+With `--localscratch`, the restart file is read once from shared storage at the
+transient stage; only new output is written to (and staged back from) local
+scratch. `wiemip_split` prints a warning if a restart is configured while PR/EQ
+years are non-zero.
+
 ### wiemip_end_to_end.py
 
 Script: `src/batch_processing/extra/wiemip_end_to_end.py` — runs `wiemip_split`, optional restart seeding, `bp batch run`, rerun passes, `wiemip_merge`, and plotting.
@@ -156,6 +249,7 @@ CMT flags (forwarded to `wiemip_split`):
 * `--no-max-cmt` — disable that prefilter.
 * `--cmt0-filter` — disable cells where `veg_class == 0`.
 * `--no-runmask-prefilter` — skip climate invalid-cell prefilter.
+* `--localscratch` — forward node-local-scratch runner generation to `wiemip_split`.
 
 `--restart_from` copies only restart NetCDFs from `batch_x/output/`; it does not copy `run-mask.nc` from the source split.
 
@@ -197,6 +291,13 @@ Behavior:
   config/slurm paths, and updates retry `run-mask.nc` to run only incomplete cells.
 * Auto-submits `retry/slurm_runner.sh` unless `--no-submit` is used.
 * If no incomplete cells are found, exits without creating or submitting a retry.
+
+Arguments:
+
+* `batch_path`: Path to a single incomplete batch directory. Required (positional).
+* `--force`: Overwrite the existing `retry` directory if it already exists. Optional.
+* `--submit/--no-submit`: Submit the retry job automatically after preparing it. Optional, on by default.
+* `-p/--partition`: Slurm partition for retry batch jobs. Optional, by default `dask`.
 
 Examples:
 
@@ -240,9 +341,17 @@ bp batch wiemip_rerun_merge /mnt/exacloud/$USER/wiemip_batches/batch_44
 ### bp batch run
 
 Submits all of the jobs to Slurm in the given batch folder.
-It takes one argument:
+By default it submits every job immediately and lets Slurm queue them.
+It takes the following arguments:
 
-* `-b/--batches`: Path that stores job folders.
+* `-b/--batches`: Path that stores job folders (absolute, or relative to `/mnt/exacloud/$USER`). Required.
+* `--throttle`: Pause submission while the queue is full instead of submitting everything at once. Optional.
+* `--max-concurrent`: With `--throttle`, maximum running jobs before pausing submission. Optional, by default `16`.
+* `--max-queue-depth`: With `--throttle`, maximum running + pending jobs before pausing submission. Optional, by default `32`.
+* `--submit-delay`: Seconds to sleep between individual `sbatch` calls. Optional, by default `0.25`.
+* `--poll-interval`: With `--throttle`, seconds between queue checks. Optional, by default `30`.
+* `--skip-complete/--no-skip-complete`: Skip batches whose `run_status.nc` shows all active cells complete. Optional, off by default.
+* `--dry-run`: Print the submission plan without calling `sbatch`. Optional.
 
 Assuming `bp batch split` is run with `-b first-run`, running `bp batch run -b first-run` submits all the jobs in that folder to the Slurm controller.
 

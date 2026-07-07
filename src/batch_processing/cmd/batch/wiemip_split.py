@@ -744,8 +744,43 @@ class WiemipSplitCommand(BatchSplitCommand):
             attrs=run_mask_da.attrs.copy(),
         )
 
+    def _warn_restart_with_prerun_years(self) -> None:
+        """Guard the common restart foot-gun.
+
+        dvmdostem asserts that PR and EQ years are 0 when a restart file is set
+        (see TEM.cpp advance_model). Setting restart_from (explicit path or
+        scenario continuation) together with -p>0 or -e>0 makes every batch job
+        abort immediately. Warn loudly before submission so users catch it here.
+        """
+        restart_from = getattr(self._args, "restart_from", None)
+        scenario_continuation = getattr(self._args, "scenario_continuation", False)
+        restart_active = bool(restart_from) or scenario_continuation
+        if not restart_active:
+            return
+        p = int(getattr(self._args, "p", 0) or 0)
+        e = int(getattr(self._args, "e", 0) or 0)
+        if p > 0 or e > 0:
+            import typer
+            label = (
+                f"restart_from={restart_from!r}"
+                if restart_from
+                else "scenario_continuation=True"
+            )
+            typer.secho(
+                "[wiemip_split] WARNING: a restart is configured "
+                f"({label}) but PR/EQ years are non-zero (-p {p} -e {e}). "
+                "dvmdostem cannot run PR or EQ years when restarting and every "
+                "batch will abort with "
+                "'Cannot run PR years when restarting from a previous run'. "
+                "For a restart, set -p 0 -e 0 (and -s 0 to start from a spin-up "
+                "restart into the transient stage).",
+                err=True,
+                fg=typer.colors.YELLOW,
+            )
+
     def execute(self) -> None:
         print("[wiemip_split] Starting integrated WIEMIP split workflow")
+        self._warn_restart_with_prerun_years()
         slurm_partition = getattr(self._args, "slurm_partition", "spot")
         mpi_ranks = getattr(self._args, "mpi_ranks", None)
         if mpi_ranks is not None:

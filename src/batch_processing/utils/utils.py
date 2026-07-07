@@ -841,8 +841,14 @@ def update_config(
     """
     config_data = read_json_file(path)
     for key, val in IO_PATHS.items():
-        if key == "restart_from" and scenario_continuation:
-            config_data["IO"][key] = f"{prefix_value}/output/restart-tr.nc"
+        if key == "restart_from":
+            # A fresh pr->eq->sp->tr run must have an EMPTY restart_from; the model
+            # asserts PR years == 0 when restart_from is set. Only scenario
+            # continuation (or an explicit override below) sets a restart file.
+            if scenario_continuation:
+                config_data["IO"][key] = f"{prefix_value}/output/restart-tr.nc"
+            else:
+                config_data["IO"][key] = ""
         else:
             config_data["IO"][key] = f"{prefix_value}/{val}"
     if restart_from is not None:

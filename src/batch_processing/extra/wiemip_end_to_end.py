@@ -609,6 +609,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--localscratch",
+        action="store_true",
+        help=(
+            "Generate node-local-scratch slurm_runner.sh scripts: each batch writes "
+            "model output to the compute node's local disk during the run and stages "
+            "results back on exit. Avoids NFS parallel-I/O contention across "
+            "concurrent batches. Forwarded to `bp batch wiemip_split`."
+        ),
+    )
+    parser.add_argument(
         "-p",
         type=int,
         default=10,
@@ -792,6 +802,8 @@ def main() -> None:
             )
         if args.slurm_partition:
             split_cmd.extend(["-sp", args.slurm_partition])
+        if args.localscratch:
+            split_cmd.append("--localscratch")
         if args.runmask_prefilter:
             split_cmd.append("--runmask-prefilter")
         else:
