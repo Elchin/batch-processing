@@ -344,7 +344,7 @@ python ~/batch-processing/src/batch_processing/extra/wiemip_end_to_end.py \
   --localscratch \
   --cmt0-filter --max-cmt 74 \
   -sp compute --mpi-ranks 8 --rerun-partition compute \
-  -p 100 -e 2000 -s 200 -t 150 -n 0
+  -p 100 -e 2000 -s 200 -t 150
 ```
 
 Useful extras for the end-to-end script:
