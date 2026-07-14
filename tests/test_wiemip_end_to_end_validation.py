@@ -72,3 +72,24 @@ def test_validate_option2_restart_raises_on_batch_count_mismatch(e2e, tmp_path):
             nbatches=3,
             restart_file="restart-sp.nc",
         )
+
+
+def test_resolve_skip_complete_defaults(e2e):
+    class Args:
+        pass
+
+    args = Args()
+    args.no_skip_complete = False
+    args.skip_complete = False
+    args.skip_split = False
+    assert e2e.resolve_skip_complete(args) is False
+
+    args.skip_split = True
+    assert e2e.resolve_skip_complete(args) is True
+
+    args.no_skip_complete = True
+    assert e2e.resolve_skip_complete(args) is False
+
+    args.no_skip_complete = False
+    args.skip_complete = True
+    assert e2e.resolve_skip_complete(args) is True

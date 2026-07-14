@@ -76,12 +76,25 @@ def normalize_path(path_str: str) -> Path:
     return Path(os.path.abspath(expanded))
 
 
-def run_cmd(command: Sequence[str], dry_run: bool = False) -> subprocess.CompletedProcess | None:
+def run_cmd(
+    command: Sequence[str],
+    dry_run: bool = False,
+    *,
+    echo_output: bool = False,
+) -> subprocess.CompletedProcess | None:
     printable = " ".join(f'"{part}"' if " " in part else part for part in command)
     print(f"[RUN] {printable}")
     if dry_run:
         return None
-    return subprocess.run(command, check=True, text=True, capture_output=True)
+    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    if echo_output or result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+        if result.stderr:
+            print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
+    if result.returncode != 0:
+        result.check_returncode()
+    return result
 
 
 def get_spatial_dims(dim_names: Iterable[str]) -> Tuple[str, str]:
@@ -176,6 +189,152 @@ def count_completed_cells(run_status_path: Path) -> int:
         raise ValueError(f"Unreadable run_status file: {run_status_path} ({exc})") from exc
     completed = np.isfinite(status_values) & np.isclose(status_values, RUN_SUCCESS_VALUE)
     return int(np.sum(completed))
+
+
+def is_batch_complete(split_path: Path, batch_id: int) -> bool:
+    """True when all active cells in a batch have run_status == 100."""
+    batch_dir = split_path / f"batch_{batch_id}"
+    run_mask_path = batch_dir / "input" / "run-mask.nc"
+    run_status_path = batch_dir / "output" / "run_status.nc"
+    if not run_mask_path.is_file() or not run_status_is_valid(run_status_path):
+        return False
+    try:
+        n_cells = count_active_cells(run_mask_path)
+        m_cells = count_completed_cells(run_status_path)
+    except (ValueError, KeyError):
+        return False
+    return m_cells >= n_cells
+
+
+def batch_progress_for_ids(
+    split_path: Path, batch_ids: Sequence[int]
+) -> Tuple[List[int], Dict[int, Tuple[int, int]]]:
+    """Return incomplete ids (subset of batch_ids) and progress for all monitored ids."""
+    all_incomplete, all_progress = collect_incomplete_batches(split_path)
+    monitored = set(batch_ids)
+    incomplete = [batch_id for batch_id in all_incomplete if batch_id in monitored]
+    progress = {batch_id: all_progress.get(batch_id, (0, 0)) for batch_id in batch_ids}
+    return incomplete, progress
+
+
+def _active_job_names(user: str, expected_names: set[str]) -> set[str]:
+    result = subprocess.run(
+        ["squeue", "-h", "-u", user, "-o", "%A|%j|%T"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    active_names: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        job_name = parts[1].strip()
+        if job_name in expected_names:
+            active_names.add(job_name)
+    return active_names
+
+
+def _expected_job_names(split_path: Path, batch_ids: Sequence[int], *, retry_jobs: bool) -> set[str]:
+    split_name = split_path.name
+    suffix = "-retry" if retry_jobs else ""
+    return {f"{split_name}-batch-{batch_id}{suffix}" for batch_id in batch_ids}
+
+
+def wait_for_batch_completion(
+    split_path: Path,
+    batch_ids: Sequence[int],
+    poll_seconds: int,
+    *,
+    retry_jobs: bool = False,
+    dry_run: bool = False,
+    max_wait_seconds: int | None = None,
+    stable_empty_polls: int = 2,
+) -> None:
+    """Poll run_status / squeue until batches finish or are ready for recovery.
+
+    Exit conditions:
+    - all monitored batches have run_status == 100
+    - queue is empty for ``stable_empty_polls`` consecutive checks while some
+      batches remain incomplete (jobs crashed / finished early → proceed to rerun)
+    - optional ``max_wait_seconds`` elapsed with an empty queue
+    """
+    if not batch_ids:
+        print("[WAIT] No batch ids provided, skipping completion wait.")
+        return
+    if dry_run:
+        print("[WAIT] Dry-run mode, skipping completion polling.")
+        return
+
+    user = os.getenv("USER")
+    if not user:
+        raise EnvironmentError("USER environment variable is not set.")
+
+    expected_names = _expected_job_names(split_path, batch_ids, retry_jobs=retry_jobs)
+    label = "retry" if retry_jobs else "initial"
+    print(
+        f"[WAIT] Waiting for {len(batch_ids)} batch(es) to finish or leave the queue "
+        f"({label} pass)."
+    )
+
+    start_time = time.time()
+    empty_incomplete_streak = 0
+    while True:
+        incomplete, progress = batch_progress_for_ids(split_path, batch_ids)
+        active_names = _active_job_names(user, expected_names)
+        elapsed = time.time() - start_time
+
+        if not incomplete:
+            print(f"[WAIT] All {len(batch_ids)} monitored batches complete ({elapsed:.0f}s).")
+            return
+
+        if active_names:
+            empty_incomplete_streak = 0
+            print(
+                f"[WAIT] {len(incomplete)} incomplete, {len(active_names)} matching job(s) "
+                f"in queue ({elapsed:.0f}s): "
+                + format_incomplete_progress(incomplete, progress)
+            )
+            time.sleep(poll_seconds)
+            continue
+
+        # Queue empty but some batches still incomplete. Allow a short streak so
+        # localscratch stage-back / run_status sync can land before declaring done.
+        empty_incomplete_streak += 1
+        if empty_incomplete_streak >= stable_empty_polls:
+            print(
+                "[WAIT] Queue empty with incomplete batches after "
+                f"{empty_incomplete_streak} checks ({elapsed:.0f}s): "
+                + format_incomplete_progress(incomplete, progress)
+                + ". Proceeding to recovery / next step."
+            )
+            return
+
+        if max_wait_seconds is not None and elapsed >= max_wait_seconds:
+            print(
+                "[WARN] Timed out waiting for batch completion after "
+                f"{elapsed:.0f}s: "
+                + format_incomplete_progress(incomplete, progress)
+            )
+            return
+
+        print(
+            f"[WAIT] Queue empty but {len(incomplete)} incomplete "
+            f"(check {empty_incomplete_streak}/{stable_empty_polls}, {elapsed:.0f}s): "
+            + format_incomplete_progress(incomplete, progress)
+        )
+        time.sleep(poll_seconds)
+
+
+def resolve_skip_complete(args: argparse.Namespace) -> bool:
+    """Default to skipping complete batches when resuming an existing split."""
+    if getattr(args, "no_skip_complete", False):
+        return False
+    if getattr(args, "skip_complete", False):
+        return True
+    if getattr(args, "skip_split", False):
+        return True
+    return False
 
 
 def collect_incomplete_batches(split_path: Path) -> Tuple[List[int], Dict[int, Tuple[int, int]]]:
@@ -406,6 +565,7 @@ def run_rerun_pass(
     dry_run: bool,
     rerun_partition: str = DEFAULT_RERUN_PARTITION,
     initial_grace_seconds: int = 120,
+    max_wait_seconds: int | None = None,
 ) -> None:
     if not batch_ids:
         print(f"[PASS {pass_index}] No incomplete batches. Skipping rerun pass.")
@@ -431,6 +591,7 @@ def run_rerun_pass(
                 batch_path.as_posix(),
                 "--partition",
                 rerun_partition,
+                "--force",
             ],
             dry_run=dry_run,
         )
@@ -442,6 +603,14 @@ def run_rerun_pass(
         poll_seconds=poll_seconds,
         dry_run=dry_run,
         initial_grace_seconds=initial_grace_seconds,
+    )
+    wait_for_batch_completion(
+        split_path=split_path,
+        batch_ids=batch_ids,
+        poll_seconds=poll_seconds,
+        retry_jobs=True,
+        dry_run=dry_run,
+        max_wait_seconds=max_wait_seconds,
     )
 
     for batch_id in batch_ids:
@@ -535,10 +704,20 @@ def main() -> None:
     parser.add_argument(
         "--initial-grace-seconds",
         type=int,
-        default=120,
+        default=300,
         help=(
-            "Seconds to keep polling before treating an empty queue as finished "
-            "when no matching jobs were seen yet (default: 120)."
+            "Seconds to keep polling squeue before treating an empty queue as finished "
+            "when no matching jobs were seen yet (default: 300)."
+        ),
+    )
+    parser.add_argument(
+        "--max-wait-seconds",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Optional cap on run_status polling after jobs leave the queue. "
+            "Default: wait until all monitored batches complete."
         ),
     )
     parser.add_argument(
@@ -609,6 +788,41 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--skip-run",
+        action="store_true",
+        help=(
+            "Skip `bp batch run` and the initial queue/completion wait. "
+            "Use with --skip-split to resume from rerun/merge only."
+        ),
+    )
+    parser.add_argument(
+        "--skip-complete",
+        action="store_true",
+        help=(
+            "Pass --skip-complete to `bp batch run` (do not resubmit batches whose "
+            "run_status.nc shows all active cells complete). Enabled by default when "
+            "using --skip-split."
+        ),
+    )
+    parser.add_argument(
+        "--no-skip-complete",
+        action="store_true",
+        help=(
+            "Force `bp batch run` to submit every batch even when resuming with "
+            "--skip-split."
+        ),
+    )
+    parser.add_argument(
+        "--skip-merge",
+        action="store_true",
+        help="Skip `bp batch wiemip_merge` (useful if merge OOMs on the login node).",
+    )
+    parser.add_argument(
+        "--skip-plot",
+        action="store_true",
+        help="Skip the post-merge plot step.",
+    )
+    parser.add_argument(
         "--localscratch",
         action="store_true",
         help=(
@@ -641,6 +855,12 @@ def main() -> None:
         type=int,
         default=10,
         help="TRANSIENT years for split setup (default: 10).",
+    )
+    parser.add_argument(
+        "-n",
+        type=int,
+        default=0,
+        help="SCENARIO years for split setup (default: 0).",
     )
     parser.add_argument(
         "--runmask-prefilter",
@@ -792,6 +1012,8 @@ def main() -> None:
             str(args.s),
             "-t",
             str(args.t),
+            "-n",
+            str(args.n),
         ]
         if args.split_mode == "rect":
             split_cmd.extend(
@@ -891,40 +1113,68 @@ def main() -> None:
             f"{missing_restart_count} missing source {args.restart_file}"
         )
 
-    # Step 2: Submit all batch jobs (Slurm queues them).
-    run_cmd_cmd = [
-        "bp",
-        "batch",
-        "run",
-        "-b",
-        split_path.as_posix(),
-        "--submit-delay",
-        str(args.submit_delay),
-    ]
-    if args.throttle:
-        run_cmd_cmd.extend(
-            [
-                "--throttle",
-                "--max-concurrent",
-                str(args.max_concurrent),
-                "--max-queue-depth",
-                str(args.max_queue_depth),
-                "--poll-interval",
-                str(args.submit_poll_seconds),
-            ]
-        )
-    run_cmd(run_cmd_cmd, dry_run=args.dry_run)
+    # Step 2: Submit batch jobs (Slurm queues them).
+    skip_complete = resolve_skip_complete(args)
+    incomplete_before_run, pre_run_progress = collect_incomplete_batches(split_path)
+    if args.skip_run:
+        print("[STEP 2] Skipping batch run (--skip-run).")
+    elif skip_complete and not incomplete_before_run:
+        print("[STEP 2] All batches already complete; skipping submit (--skip-complete).")
+    else:
+        if skip_complete:
+            print(
+                "[STEP 2] Submitting incomplete batches only (--skip-complete): "
+                + format_incomplete_progress(incomplete_before_run, pre_run_progress)
+            )
+        run_cmd_cmd = [
+            "bp",
+            "batch",
+            "run",
+            "-b",
+            split_path.as_posix(),
+            "--submit-delay",
+            str(args.submit_delay),
+        ]
+        if skip_complete:
+            run_cmd_cmd.append("--skip-complete")
+        if args.throttle:
+            run_cmd_cmd.extend(
+                [
+                    "--throttle",
+                    "--max-concurrent",
+                    str(args.max_concurrent),
+                    "--max-queue-depth",
+                    str(args.max_queue_depth),
+                    "--poll-interval",
+                    str(args.submit_poll_seconds),
+                ]
+            )
+        run_cmd(run_cmd_cmd, dry_run=args.dry_run, echo_output=True)
 
-    # Step 3: Wait until this run's batch jobs are out of queue.
-    expected_initial_ids = list(range(nbatches))
-    wait_for_jobs(
-        split_path=split_path,
-        batch_ids=expected_initial_ids,
-        retry_jobs=False,
-        poll_seconds=args.poll_seconds,
-        dry_run=args.dry_run,
-        initial_grace_seconds=args.initial_grace_seconds,
-    )
+        # Step 3: Wait for submitted batches to finish.
+        if skip_complete:
+            wait_batch_ids = incomplete_before_run
+        else:
+            wait_batch_ids = list(range(nbatches))
+        if wait_batch_ids:
+            wait_for_jobs(
+                split_path=split_path,
+                batch_ids=wait_batch_ids,
+                retry_jobs=False,
+                poll_seconds=args.poll_seconds,
+                dry_run=args.dry_run,
+                initial_grace_seconds=args.initial_grace_seconds,
+            )
+            wait_for_batch_completion(
+                split_path=split_path,
+                batch_ids=wait_batch_ids,
+                poll_seconds=args.poll_seconds,
+                retry_jobs=False,
+                dry_run=args.dry_run,
+                max_wait_seconds=args.max_wait_seconds,
+            )
+        else:
+            print("[STEP 3] No batches to wait for.")
 
     if args.dry_run:
         print("[INFO] Dry-run mode complete. No filesystem/queue checks beyond this point.")
@@ -946,6 +1196,7 @@ def main() -> None:
             dry_run=args.dry_run,
             rerun_partition=args.rerun_partition,
             initial_grace_seconds=args.initial_grace_seconds,
+            max_wait_seconds=args.max_wait_seconds,
         )
     else:
         print("[STEP 4] No incomplete batches after initial run.")
@@ -965,6 +1216,7 @@ def main() -> None:
             dry_run=args.dry_run,
             rerun_partition=args.rerun_partition,
             initial_grace_seconds=args.initial_grace_seconds,
+            max_wait_seconds=args.max_wait_seconds,
         )
     else:
         print("[STEP 9] No second rerun pass needed.")
@@ -978,19 +1230,40 @@ def main() -> None:
     else:
         print("[INFO] All batches complete after rerun passes.")
 
-    # Step 10: final WIEMIP merge (Y-stripe batches from wiemip_split).
-    run_cmd(["bp", "batch", "wiemip_merge", "-b", split_path.as_posix()], dry_run=False)
+    # Step 10: final WIEMIP merge.
+    if args.skip_merge:
+        print("[STEP 10] Skipping merge (--skip-merge).")
+    else:
+        print(
+            "[STEP 10] Running wiemip_merge on the login node. "
+            "If this is killed (SIGKILL/OOM), rerun manually: "
+            f"bp batch wiemip_merge -b {split_path.as_posix()}"
+        )
+        run_cmd(
+            ["bp", "batch", "wiemip_merge", "-b", split_path.as_posix()],
+            dry_run=False,
+            echo_output=True,
+        )
 
     # Step 11: plot merged outputs.
+    if args.skip_plot:
+        print("[STEP 11] Skipping plot (--skip-plot).")
+        print("[DONE] End-to-end workflow finished.")
+        return
+
     merged_restored = split_path / "wiemip_merged" / "merged_restored"
     if not merged_restored.exists():
-        raise FileNotFoundError(f"Merged output directory not found: {merged_restored}")
+        raise FileNotFoundError(
+            f"Merged output directory not found: {merged_restored}. "
+            "Run merge manually or omit --skip-merge on a node with enough RAM."
+        )
     if not plot_script.exists():
         raise FileNotFoundError(f"Plot script not found: {plot_script}")
 
     run_cmd(
         [sys.executable, plot_script.as_posix(), merged_restored.as_posix()],
         dry_run=False,
+        echo_output=True,
     )
     print("[DONE] End-to-end workflow finished.")
 
